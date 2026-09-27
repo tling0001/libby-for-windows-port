@@ -20,7 +20,7 @@ const PRODUCT = 'Dewey';
 const SPEC = 'V32';
 const ENVIRONMENT = 'charlie';
 const APP_CHROME_VERSION = '140.0.0.0';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${APP_CHROME_VERSION} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
+const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${APP_CHROME_VERSION} Safari/537.36 (Dewey; V32; Android; ${APP_VERSION}; RELEASE)`;
 
 // Electron documents app.userAgentFallback as the global fallback. Setting it
 // before ready also covers child windows/popups; the persistent Libby session
@@ -248,7 +248,7 @@ function platformTraits(dest = 'client') {
     name: 'platform:traits',
     dest,
     device: {
-      brand: 'Microsoft', model: 'Windows PC', platform: 'Windows',
+      brand: 'Microsoft', model: 'Windows PC', platform: 'Android',
       platformBuild: process.getSystemVersion(), platformVersion: process.getSystemVersion(), platformVersionInt: 0
     },
     profile: {
@@ -403,9 +403,15 @@ function setupSession(ses) {
         if (/^sec-ch-ua/i.test(key)) delete details.requestHeaders[key];
       }
       details.requestHeaders['Sec-CH-UA'] = '"Chromium";v="140", "Google Chrome";v="140"';
-      details.requestHeaders['Sec-CH-UA-Mobile'] = '?0';
-      details.requestHeaders['Sec-CH-UA-Platform'] = '"Windows"';
+      details.requestHeaders['Sec-CH-UA-Mobile'] = '?1';
+      details.requestHeaders['Sec-CH-UA-Platform'] = '"Android"';
       callback({ requestHeaders: details.requestHeaders });
+    });
+    ses.webRequest.onCompleted({ urls: ['https://libbyapp.com/*', 'https://*.libbyapp.com/*'] }, (details) => {
+      if (details.statusCode >= 400) diagnostic('network:http-error', { url: details.url, statusCode: details.statusCode, method: details.method, resourceType: details.resourceType });
+    });
+    ses.webRequest.onErrorOccurred({ urls: ['https://libbyapp.com/*', 'https://*.libbyapp.com/*'] }, (details) => {
+      diagnostic('network:error', { url: details.url, error: details.error, method: details.method, resourceType: details.resourceType });
     });
   } catch (e) { diagnostic('webrequest:setup-error', { error: String(e) }); }
 
@@ -1082,18 +1088,18 @@ function createWindow() {
     // able to see and diagnose the real loading page.
     closeSplash();
   });
-  // Electron may delay ready-to-show for a remote page with a slow renderer.
-  // Android would already have dismissed its OS splash by this point, so make
-  // the Windows splash have the same bounded lifetime. This also guarantees
-  // the user can see the actual Libby loading screen.
-  setTimeout(() => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (!mainWindow.isVisible()) mainWindow.show();
-      closeSplash();
-    }
-  }, 1800);
+  // No artificial timeout: Android keeps its launch screen until the Activity
+  // content is ready. Escape remains available on the splash for recovery.
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
+  // Android's custom WebView calls clearCache(true) before every loadUrl().
+  // Mirror that on the first desktop boot without touching persistent cookies
+  // or IndexedDB.
+  Promise.resolve().then(async () => {
+    try { await ses.clearCache(); diagnostic('android-webview:cache-cleared'); } catch (e) { diagnostic('android-webview:cache-clear-error', { error: String(e) }); }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
+    }
+  });
   bootTimer = setTimeout(() => {
     if (!bootCompleted && mainWindow && !mainWindow.isDestroyed()) {
       diagnostic('boot:timeout', {

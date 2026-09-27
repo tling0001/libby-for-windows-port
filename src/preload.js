@@ -37,9 +37,9 @@ const ENVIRONMENT = 'charlie';
 // is safe while shell messages go through the isolated IPC boundary.
 
 try {
-  Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Win32' });
+  Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Linux armv8l' });
   Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' });
-  Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 0 });
+  Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 5 });
   // Electron exposes Chromium UA Client Hints that can reveal the host even when
   // navigator.userAgent is overridden. Present ordinary Chrome/Windows hints.
   const chromeMajor = 140;
@@ -48,19 +48,58 @@ try {
       { brand: 'Chromium', version: String(chromeMajor) },
       { brand: 'Google Chrome', version: String(chromeMajor) }
     ],
-    mobile: false,
-    platform: 'Windows',
+    mobile: true,
+    platform: 'Android',
     getHighEntropyValues: async () => ({
       brands: [
         { brand: 'Chromium', version: String(chromeMajor) },
         { brand: 'Google Chrome', version: String(chromeMajor) }
       ],
-      mobile: false, platform: 'Windows', platformVersion: '10.0.0',
-      architecture: 'x86', bitness: '64', model: '', uaFullVersion: String(process.versions.chrome || '')
+      mobile: true, platform: 'Android', platformVersion: '15',
+      architecture: 'arm', bitness: '64', model: '', uaFullVersion: String(process.versions.chrome || '')
     })
   };
   Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => uaData });
   Object.defineProperty(Navigator.prototype, 'webdriver', { configurable: true, get: () => false });
+} catch {}
+
+// Android WebView exposes the BRIDGE in the page's main world before Libby's
+// scripts execute. Electron's contextBridge exposes the same API there, but
+// navigator.userAgentData must also be patched in the main world (the preload
+// isolated world cannot alter the page's Navigator prototype).
+try {
+  if (typeof contextBridge.executeInMainWorld === 'function') {
+    contextBridge.executeInMainWorld({
+      func: () => {
+        try {
+          const brands = [
+            { brand: 'Chromium', version: '140' },
+            { brand: 'Google Chrome', version: '140' }
+          ];
+          const uaData = {
+            brands,
+            mobile: true,
+            platform: 'Android',
+            getHighEntropyValues: async () => ({
+              brands,
+              mobile: true,
+              platform: 'Android',
+              platformVersion: '15',
+              architecture: 'arm',
+              bitness: '64',
+              model: '',
+              uaFullVersion: '140.0.0.0'
+            })
+          };
+          Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => uaData });
+          Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Linux armv8l' });
+          Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' });
+          Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 5 });
+          Object.defineProperty(Navigator.prototype, 'webdriver', { configurable: true, get: () => false });
+        } catch {}
+      }
+    });
+  }
 } catch {}
 
 contextBridge.exposeInMainWorld('BRIDGE', {
