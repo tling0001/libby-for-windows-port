@@ -6,7 +6,7 @@ const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
 const PRODUCT = 'Libby';
 const ENVIRONMENT = 'charlie';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36 (Dewey; V32; Android; ${APP_VERSION}; RELEASE)`;
+const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
 
 let mainWindow;
 let shellState = { lastNavigation: ROOT_URL };
@@ -55,11 +55,11 @@ function capabilities() {
     'ui:auth-webview': true,
     'network:info': true,
     'debug:diagnostics-option': false,
-    'debug:download-queue': true,
+    'debug:download-queue': false,
     'diagnostics:log': true,
     'audio:autonomous': true,
     geolocation: true,
-    'ui:haptics': false,
+    'ui:haptics': true,
     'feedback:store': null,
     'email:compose': true,
     'platform:traits': true,
@@ -242,9 +242,9 @@ function createWindow() {
   } catch {}
 }
 
-ipcMain.handle('bridge-capabilities', () => capabilities());
-ipcMain.handle('bridge-environment', () => ENVIRONMENT);
-ipcMain.handle('bridge-shell-message', (_event, raw) => handleShellMessage(raw));
+ipcMain.on('bridge-capabilities-sync', (event) => { event.returnValue = capabilities(); });
+ipcMain.on('bridge-environment-sync', (event) => { event.returnValue = ENVIRONMENT; });
+ipcMain.on('bridge-shell-message', (_event, raw) => { void handleShellMessage(raw); });
 ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir() }));
 ipcMain.handle('open-external', (_event, url) => shell.openExternal(url));
 

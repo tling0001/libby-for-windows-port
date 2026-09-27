@@ -1,21 +1,21 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Compatibility bridge matching the Android shell's three JavaScript-visible methods.
+// Libby's Android shell exposes a synchronous JavaScript bridge named BRIDGE.
+// Keep the same API shape on Windows: capabilities() and environment() return
+// strings immediately, while clientToShellAsJSON() is fire-and-forget.
 contextBridge.exposeInMainWorld('BRIDGE', {
-  capabilities: () => ipcRenderer.invoke('bridge-capabilities'),
-  environment: () => ipcRenderer.invoke('bridge-environment'),
-  clientToShellAsJSON: (json) => ipcRenderer.invoke('bridge-shell-message', json)
+  capabilities: () => ipcRenderer.sendSync('bridge-capabilities-sync'),
+  environment: () => ipcRenderer.sendSync('bridge-environment-sync'),
+  clientToShellAsJSON: (json) => ipcRenderer.send('bridge-shell-message', json)
 });
 
-// Small compatibility surface for native events the web client can listen for.
-window.addEventListener('DOMContentLoaded', () => {
-  window.postMessage({ source: 'libby-windows-port', type: 'platform-ready' }, '*');
-});
-
+// The Android shell delivers native -> web messages as a CustomEvent named
+// exactly "bridge:receive". Libby listens for this event, so do not substitute
+// window.postMessage here.
 ipcRenderer.on('libby-shell-event', (_event, payload) => {
-  window.postMessage({ source: 'libby-windows-port', type: 'shell-event', payload }, '*');
+  window.dispatchEvent(new CustomEvent('bridge:receive', { detail: payload }));
 });
 
 ipcRenderer.on('libby-media-key', (_event, key) => {
-  window.postMessage({ source: 'libby-windows-port', type: 'media-key', key }, '*');
+  window.dispatchEvent(new CustomEvent('libby:media-key', { detail: { key } }));
 });
