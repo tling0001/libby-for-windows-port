@@ -262,51 +262,85 @@ async function handleShellMessage(raw) {
   if (name === 'audio:sleep-at-position' || name === 'audio:milestones') return;
 }
 
-function makeSplash() {
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return;
+  const { screen } = require('electron');
+  const display = screen.getPrimaryDisplay();
+  const { x, y, width, height } = display.bounds;
   splashClosed = false;
   splashWindow = new BrowserWindow({
-    width: 500,
-    height: 500,
+    x, y, width, height,
     frame: false,
     resizable: false,
     movable: false,
     minimizable: false,
     maximizable: false,
     closable: true,
-    skipTaskbar: true,
+    fullscreen: true,
     alwaysOnTop: true,
     show: false,
     backgroundColor: '#111111',
-    icon: path.join(__dirname, '..', 'assets', 'libby.ico'),
-    webPreferences: { contextIsolation: true, sandbox: true }
+    skipTaskbar: true,
+    focusable: true,
+    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
   });
-
-  const icon = `file://${path.join(__dirname, '..', 'assets', 'libby.ico').replace(/\\\\/g, '/')}`;
-  splashWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
-    <!doctype html>
-    <html><head><style>
-      html,body{margin:0;width:100%;height:100%;background:#111111;overflow:hidden}
-      body{display:flex;align-items:center;justify-content:center}
-      img{width:180px;height:180px;object-fit:contain;opacity:0;animation:show .65s ease-out forwards}
-      @keyframes show{from{opacity:0;transform:scale(.94)}to{opacity:1;transform:scale(1)}}
-    </style></head><body><img src="${icon}"></body></html>
-  `)}`).catch(() => {});
+  splashWindow.setAlwaysOnTop(true, 'floating');
+  splashWindow.loadFile(path.join(__dirname, 'splash.html'));
   splashWindow.once('ready-to-show', () => {
     if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
+  });
+  splashWindow.webContents.on('before-input-event', (_event, input) => {
+    if (input.key === 'Escape' && input.type === 'keyDown') closeSplash(true);
   });
   splashWindow.on('closed', () => { splashWindow = null; splashClosed = true; });
 }
 
-function closeSplash() {
-  if (splashClosed || !splashWindow || splashWindow.isDestroyed()) return;
+function closeSplash(immediate = false) {
+  const splash = splashWindow;
+  if (!splash || splash.isDestroyed()) {
+    splashWindow = null;
+    return;
+  }
   splashClosed = true;
-  const w = splashWindow;
-  splashWindow = null;
-  try { w.close(); } catch {}
+  try { splash.setAlwaysOnTop(false); } catch {}
+  if (immediate) {
+    try { splash.destroy(); } catch {}
+    if (splashWindow === splash) splashWindow = null;
+    return;
+  }
+  // Keep the Android-style launch artwork for a brief, polished fade only
+  // after the real Libby window has become visible. No startup timeout is used.
+  splash.webContents.executeJavaScript(
+    `document.body.style.transition='opacity .16s ease';document.body.style.opacity='0';`
+  ).catch(() => {});
+  setTimeout(() => {
+    if (!splash.isDestroyed()) {
+      try { splash.close(); } catch { try { splash.destroy(); } catch {} }
+    }
+    if (splashWindow === splash) splashWindow = null;
+  }, 180);
 }
 
 function createWindow() {
   const partition = 'persist:libby';
+  // Keep the desktop shell polished without changing Libby's web UI.
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: 'Libby', submenu: [
+      { label: 'Reload', accelerator: 'Ctrl+R', click: () => mainWindow?.webContents.reload() },
+      { label: 'Hard Reload', accelerator: 'Ctrl+Shift+R', click: () => mainWindow?.webContents.reloadIgnoringCache() },
+      { type: 'separator' },
+      { role: 'toggleDevTools' },
+      { type: 'separator' },
+      { role: 'quit' }
+    ]},
+    { label: 'View', submenu: [
+      { role: 'togglefullscreen' },
+      { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' }
+    ]},
+    { label: 'Help', submenu: [
+      { label: 'Open Libby website', click: () => shell.openExternal(ROOT_URL).catch(() => {}) }
+    ]}
+  ]));
   const ses = session.fromPartition(partition);
 
   ses.setUserAgent(APP_USER_AGENT);
@@ -363,7 +397,11 @@ function createWindow() {
     });
   });
 
+  mainWindow.webContents.on('console-message', (_event, details) => {
+    try { fs.appendFileSync(path.join(dataDir(), 'diagnostics.log'), JSON.stringify({ time: new Date().toISOString(), type: 'console', level: details.level, message: details.message, source: details.sourceId, line: details.lineNumber }) + '\n'); } catch {}
+  });
   mainWindow.webContents.on('did-navigate', (_e, url) => { shellState.lastNavigation = url; });
+
   mainWindow.webContents.on('did-finish-load', () => {
     flushNativeEvents();
   });
@@ -405,7 +443,7 @@ ipcMain.handle('open-external', (_event, url) => shell.openExternal(url));
 
 app.whenReady().then(() => {
   app.setAppUserModelId('com.overdrive.mobile.android.libby');
-  makeSplash();
+  createSplashWindow();
   createWindow();
 
   app.on('activate', () => {
