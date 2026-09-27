@@ -2,11 +2,8 @@ name: Build Libby for Windows
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - "v*"
+    branches: [main, master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -28,7 +25,7 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit
 
       - name: Build Windows packages
         run: npm run dist
@@ -41,6 +38,7 @@ jobs:
             dist/*.exe
             dist/*.msi
             dist/*.zip
+            dist/*.blockmap
           if-no-files-found: warn
 
       - name: Create GitHub Release
@@ -51,4 +49,5 @@ jobs:
             dist/*.exe
             dist/*.msi
             dist/*.zip
+            dist/*.blockmap
           generate_release_notes: true

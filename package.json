@@ -9,13 +9,13 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --enable-logging",
-    "dist": "electron-builder --win nsis portable",
-    "dist:portable": "electron-builder --win portable",
-    "dist:installer": "electron-builder --win nsis"
+    "dist": "electron-builder --win nsis portable --publish never",
+    "dist:portable": "electron-builder --win portable --publish never",
+    "dist:installer": "electron-builder --win nsis --publish never"
   },
   "devDependencies": {
-    "electron": "^38.2.0",
-    "electron-builder": "^26.0.12"
+    "electron": "38.8.6",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.overdrive.mobile.windows.libby",
@@ -29,7 +29,10 @@
       "package.json"
     ],
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "assets/libby.ico",
       "requestedExecutionLevel": "asInvoker"
     },
