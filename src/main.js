@@ -985,6 +985,10 @@ function sendStartupSignals() {
   // should not have to poll for the native environment before it leaves boot.
   sendShellEvent(platformTraits('client'));
   sendShellEvent(networkInfo('client'));
+  // NautilusApp's startup task (co1 case 3) proactively publishes this exact
+  // subscription marker after application initialization. Libby uses it to
+  // establish the native playable-title channel during boot.
+  sendShellEvent({ name: 'title:list:playable', subscribe: true, dest: 'client' });
   if (bifocalWindow && !bifocalWindow.isDestroyed()) {
     sendShellEvent(platformTraits('bifocal'));
     sendShellEvent(networkInfo('bifocal'));
@@ -1019,7 +1023,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition,
-      contextIsolation: true,
+      contextIsolation: false,
       sandbox: false,
       nodeIntegration: false,
       spellcheck: true,
@@ -1061,6 +1065,7 @@ function createWindow() {
 
   mainWindow.webContents.on('dom-ready', () => {
     diagnostic('dom-ready', { url: mainWindow.webContents.getURL(), ua: mainWindow.webContents.getUserAgent() });
+    sendStartupSignals();
     executePage(mainWindow, `(function(){ return { bridge: !!window.BRIDGE, caps: !!(window.BRIDGE && window.BRIDGE.capabilities), env: !!(window.BRIDGE && window.BRIDGE.environment), send: !!(window.BRIDGE && window.BRIDGE.clientToShellAsJSON), ua: navigator.userAgent, webdriver: !!navigator.webdriver }; })()`)
       .then(result => diagnostic('bridge:page-check', result || {}));
   });
