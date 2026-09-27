@@ -33,6 +33,10 @@ let libbySession = null;
 let shellState = { lastNavigation: ROOT_URL };
 let notifications = new Map();
 let nextNotificationId = 1;
+let splashWindow = null;
+let bootTimer = null;
+let bootCompleted = false;
+let bankStore = null;
 
 function dataDir() {
   const p = path.join(app.getPath('userData'), 'libby');
@@ -70,6 +74,112 @@ function safeJson(value) {
   try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
 }
 
+function bankFile() {
+  return path.join(dataDir(), 'bank.json');
+}
+
+function loadBankStore() {
+  if (bankStore) return bankStore;
+  try {
+    const raw = fs.readFileSync(bankFile(), 'utf8');
+    bankStore = JSON.parse(raw);
+    if (!bankStore || typeof bankStore !== 'object') bankStore = {};
+  } catch { bankStore = {}; }
+  return bankStore;
+}
+
+function saveBankStore() {
+  try {
+    const tmp = bankFile() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(loadBankStore(), null, 2), 'utf8');
+    fs.renameSync(tmp, bankFile());
+  } catch (e) { diagnostic('bank:save-error', { error: String(e) }); }
+}
+
+function bankKey(msg) {
+  return String(msg.key ?? msg.id ?? msg.path ?? msg.nameKey ?? '');
+}
+
+function bankResponse(msg, name, extra = {}) {
+  const response = { ...msg, ...extra, name, dest: msg.dest === 'shell' ? 'client' : (msg.dest || 'client') };
+  sendShellEvent(response);
+  diagnostic('bank:response', { request: msg.name, response: name, key: bankKey(msg) });
+}
+
+function handleBankMessage(msg) {
+  const name = String(msg.name || '');
+  const store = loadBankStore();
+  const key = bankKey(msg);
+  diagnostic('bank:request', { name, key, hasValue: Object.prototype.hasOwnProperty.call(msg, 'value') });
+
+  if (name === 'bank:wipe:all') {
+    bankStore = {};
+    saveBankStore();
+    bankResponse(msg, 'bank:wipe:all:response', { success: true });
+    return true;
+  }
+  if (name === 'bank:delete' || name === 'bank:remove') {
+    const existed = Object.prototype.hasOwnProperty.call(store, key);
+    delete store[key]; saveBankStore();
+    bankResponse(msg, name + ':response', { key, existed, success: true });
+    return true;
+  }
+  if (name === 'bank:exists') {
+    bankResponse(msg, name + ':response', { key, exists: Object.prototype.hasOwnProperty.call(store, key) });
+    return true;
+  }
+  if (name === 'bank:list') {
+    bankResponse(msg, name + ':response', { keys: Object.keys(store) });
+    return true;
+  }
+  if (name === 'bank:read' || name === 'bank:get') {
+    bankResponse(msg, name + ':response', { key, value: Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null, found: Object.prototype.hasOwnProperty.call(store, key) });
+    return true;
+  }
+  if (name === 'bank:write' || name === 'bank:set' || name === 'bank:put') {
+    store[key] = msg.value;
+    saveBankStore();
+    bankResponse(msg, name + ':response', { key, success: true, value: msg.value });
+    return true;
+  }
+  if (name.startsWith('bank:')) {
+    // Unknown bank operations still receive an explicit acknowledgement so the
+    // client cannot deadlock indefinitely waiting for a native response.
+    bankResponse(msg, name + ':response', { success: true, key, value: null });
+    return true;
+  }
+  return false;
+}
+
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return;
+  splashWindow = new BrowserWindow({
+    width: 430, height: 330, frame: false, resizable: false, movable: false,
+    center: true, alwaysOnTop: true, show: false, backgroundColor: '#111111',
+    skipTaskbar: true, transparent: false,
+    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
+  });
+  splashWindow.loadFile(path.join(__dirname, 'splash.html'));
+  splashWindow.once('ready-to-show', () => splashWindow.show());
+  splashWindow.on('closed', () => { splashWindow = null; });
+}
+
+function closeSplash() {
+  if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.webContents.executeJavaScript(`document.body.style.transition='opacity .28s ease';document.body.style.opacity='0';`).catch(() => {});
+    setTimeout(() => { if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close(); }, 300);
+  }
+  splashWindow = null;
+}
+
+function showBootFailure(error) {
+  closeSplash();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const detail = encodeURIComponent(String(error || 'Libby startup handshake timed out'));
+  mainWindow.loadFile(path.join(__dirname, 'retry.html'), { search: `?error=${detail}` }).catch(() => {});
+}
+
 function targetWindowFor(dest, sourceContents = null) {
   if (dest === 'bifocal' && bifocalWindow && !bifocalWindow.isDestroyed()) return bifocalWindow;
   if (dest === 'auth' && authWindow && !authWindow.isDestroyed()) return authWindow;
@@ -96,31 +206,30 @@ function sendClientEvent(payload) {
 }
 
 function platformTraits(dest = 'client') {
+  const win = dest === 'bifocal' ? bifocalWindow : mainWindow;
+  const b = win && !win.isDestroyed() ? win.getContentBounds() : { width: 1280, height: 900 };
+  const areas = {
+    screenArea: { top: 0, left: 0, right: b.width, bottom: b.height },
+    safeArea: { top: 0, left: 0, right: b.width, bottom: b.height },
+    immersiveArea: { top: 0, left: 0, right: b.width, bottom: b.height }
+  };
   return {
     name: 'platform:traits',
     dest,
     device: {
-      brand: 'Microsoft',
-      model: 'Windows PC',
-      platform: 'Windows',
-      platformBuild: process.getSystemVersion(),
-      platformVersion: process.getSystemVersion(),
-      platformVersionInt: 0
+      brand: 'Microsoft', model: 'Windows PC', platform: 'Windows',
+      platformBuild: process.getSystemVersion(), platformVersion: process.getSystemVersion(), platformVersionInt: 0
     },
     profile: {
-      darkTheme: nativeTheme.shouldUseDarkColors,
-      highContrast: false,
-      storagePath: dataDir(),
-      installer: 'electron',
-      language: {
-        app: app.getLocale(),
-        system: app.getLocale()
-      },
+      fontScale: 1, invertColors: false, animationScale: 1,
+      darkTheme: nativeTheme.shouldUseDarkColors, highContrast: false,
       powerMode: 'normal',
-      backgroundActivity: true,
+      backgroundActivity: true, storagePath: dataDir(), installer: 'electron',
+      language: { app: app.getLocale(), system: app.getLocale() },
       bankWrittenByAnotherInstance: false,
       errorCorrelationId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-    }
+    },
+    displayAreas: areas
   };
 }
 
@@ -679,8 +788,7 @@ async function handleShellMessage(raw, sourceContents) {
     return;
   }
 
-  if (name === 'bank:') return;
-  if (name.startsWith('bank:')) return;
+  if (name.startsWith('bank:')) { handleBankMessage(msg); return; }
 
   // Android forwards several commands to the shell and echoes/dispatches the
   // native result. For commands without a Windows-specific implementation,
@@ -776,12 +884,29 @@ function createWindow() {
   });
   mainWindow.webContents.on('did-finish-load', () => {
     sendStartupSignals();
-    executePage(mainWindow, `window.__LIBBY_WINDOWS_BRIDGE__={version:${JSON.stringify(APP_VERSION)},environment:${JSON.stringify(ENVIRONMENT)}};`);
+    [50, 250, 1000, 3000].forEach((delay) => setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) sendStartupSignals();
+    }, delay));
+    executePage(mainWindow, `window.__LIBBY_WINDOWS_BRIDGE__={version:${JSON.stringify(APP_VERSION)},environment:${JSON.stringify(ENVIRONMENT)},native:true};`);
+    // The Android shell considers the WebView healthy once its main document has
+    // loaded. Give the remote client a generous handshake window, but never leave
+    // the desktop app on an unexplained infinite splash.
+    bootCompleted = true;
+    closeSplash();
+  });
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (isMain) showBootFailure(`${desc || 'Navigation failed'} (${code})\n${url || ''}`);
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
+  bootTimer = setTimeout(() => {
+    if (!bootCompleted && mainWindow && !mainWindow.isDestroyed()) {
+      diagnostic('boot:timeout', { url: mainWindow.webContents.getURL(), readyState: 'unknown', ua: mainWindow.webContents.getUserAgent() });
+      showBootFailure('Startup timed out before Libby finished loading.');
+    }
+  }, 30000);
 
   try {
     globalShortcut.register('MediaPlayPause', () => sendMediaKey('playpause'));
@@ -799,6 +924,19 @@ ipcMain.on('bridge-environment-sync', (event) => {
 ipcMain.on('bridge-shell-message', (event, raw) => {
   void handleShellMessage(raw, event.sender);
 });
+ipcMain.on('recovery-retry', (event) => {
+  const wc = event.sender;
+  const win = BrowserWindow.fromWebContents(wc);
+  if (!win || win.isDestroyed()) return;
+  bootCompleted = false;
+  win.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
+  if (win === mainWindow) createSplashWindow();
+});
+ipcMain.on('recovery-diagnostics', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  shell.openPath(diagnosticsFile()).catch(() => {});
+  if (win && !win.isDestroyed()) win.show();
+});
 ipcMain.on('renderer-diagnostic', (_event, payload) => diagnostic('renderer', payload || {}));
 ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir(), diagnostics: diagnosticsFile() }));
 ipcMain.handle('open-external', (_event, url) => {
@@ -807,7 +945,8 @@ ipcMain.handle('open-external', (_event, url) => {
 });
 
 app.whenReady().then(() => {
-  app.setAppUserModelId('com.overdrive.mobile.windows.libby');
+  app.setAppUserModelId('com.overdrive.mobile.android.libby');
+  createSplashWindow();
   createWindow();
   app.on('activate', () => { if (!mainWindow) createWindow(); });
 });
