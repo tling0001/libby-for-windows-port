@@ -6,7 +6,7 @@ const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
 const PRODUCT = 'Libby';
 const ENVIRONMENT = 'charlie';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (Dewey; V32; Android; ${APP_VERSION}; RELEASE)`;
+const APP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (Dewey; V32; Android; 9.5.0; RELEASE)';
 
 let mainWindow;
 let shellState = { lastNavigation: ROOT_URL };
@@ -21,125 +21,45 @@ function downloadsDir() {
   return p;
 }
 
-function sendShellEvent(payload) {
-  if (!mainWindow || mainWindow.isDestroyed() || !payload) return;
-  let json;
-  try { json = JSON.stringify(payload).replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'); } catch { return; }
-  const script = `window.dispatchEvent(new CustomEvent('bridge:receive', { detail: ${json} }));`;
-  mainWindow.webContents.executeJavaScript(script, true).catch(() => {});
-}
+function sendShellEvent(payload) { sendBridgeEvent(payload); }
 
 function platformTraits() {
-  return {
-    name: 'platform:traits',
-    dest: 'client',
-    device: {
-      brand: 'Microsoft',
-      model: 'Windows PC',
-      platform: 'Windows',
-      platformBuild: process.getSystemVersion(),
-      platformVersion: process.getSystemVersion(),
-      platformVersionInt: 0
-    },
-    profile: {
-      darkTheme: nativeTheme.shouldUseDarkColors,
-      highContrast: false,
-      storagePath: dataDir(),
-      installer: 'electron',
-      language: { app: app.getLocale(), system: app.getLocale() }
-    }
-  };
+  return { name: 'platform:traits', dest: 'client', device: {
+    brand: 'Microsoft', model: 'Windows PC', platform: 'Android',
+    platformBuild: process.getSystemVersion(), platformVersion: '9.5.0', platformVersionInt: 0
+  }, profile: { darkTheme: nativeTheme.shouldUseDarkColors, highContrast: false,
+    storagePath: dataDir(), installer: 'electron', language: { app: app.getLocale(), system: app.getLocale() } } };
 }
 
 function capabilities() {
-  return JSON.stringify({
-    bank: true,
-    'ui:bifocal-webview': true,
-    'ui:auth-webview': true,
-    'network:info': true,
-    'debug:diagnostics-option': false,
-    'debug:download-queue': true,
-    'diagnostics:log': true,
-    'audio:autonomous': true,
-    geolocation: true,
-    'ui:haptics': false,
-    'feedback:store': null,
-    'email:compose': true,
-    'platform:traits': true,
-    'audio:sleep-at-position': true,
-    'audio:milestones': true,
-    'ui:dictionary': true,
-    'ui:oauth': 'dewey-oauth',
-    'notifier:schedule': true,
-    'notifier:badge': false,
-    'notifier:list': true,
-    'nav:share': ['url', 'text', 'image', 'file'],
-    'notifier:receive': true,
-    'ui:passkey': true,
-    'audio:speech-synthesis': { supported: true, resumable: false },
-    'platform:referrer': ['install', 'session']
-  });
+  return { bank:true, 'ui:bifocal-webview':true, 'ui:auth-webview':true, 'network:info':true,
+    'debug:diagnostics-option':false, 'debug:download-queue':false, 'diagnostics:log':true,
+    'audio:autonomous':true, geolocation:true, 'ui:haptics':true, 'feedback:store':null,
+    'email:compose':true, 'platform:traits':true, 'audio:sleep-at-position':true,
+    'audio:milestones':true, 'ui:dictionary':true, 'ui:oauth':'dewey-oauth',
+    'notifier:schedule':true, 'notifier:badge':false, 'notifier:list':null,
+    'nav:share':['url','text','image','file'] };
 }
 
 async function handleShellMessage(raw) {
-  let msg;
-  try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return; }
+  let msg; try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return; }
   if (!msg || typeof msg !== 'object') return;
-
-  const name = msg.name || '';
-  const data = msg.data || msg;
-
-  if (name === 'platform:traits') {
-    sendShellEvent(platformTraits());
-    return;
-  }
-
-  if (name === 'network:info') {
-    sendShellEvent({ name, dest: msg.dest || 'client', reachable: true, metered: false, connection: 'ethernet' });
-    return;
-  }
-
-  if (name.startsWith('nav:')) {
-    shellState.lastNavigation = msg.path || msg.url || ROOT_URL;
-    return;
-  }
-
-  if (name === 'email:compose') {
-    const to = encodeURIComponent(data.to || '');
-    const subject = encodeURIComponent(data.subject || '');
-    const body = encodeURIComponent(data.body || '');
-    await shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
-    return;
-  }
-
-  if (name === 'nav:share') {
-    const text = data.text || data.url || '';
-    if (text) {
-      await require('electron').clipboard.writeText(text).catch(() => {});
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        new Notification({ title: 'Libby', body: 'Link copied to the clipboard.' }).show();
-      }
-    }
-    return;
-  }
-
+  const name = msg.name || '', data = msg.data || msg;
+  if (name === 'environment:launch') { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload(); return; }
+  if (name === 'environment:ready') { setTimeout(sendStartupEvents, 0); return; }
+  if (name === 'environment:halt') return;
+  if (name === 'platform:traits') { sendBridgeEvent(platformTraits()); return; }
+  if (name === 'network:info') { sendBridgeEvent({name,dest:msg.dest||'client',reachable:true,metered:false,connection:'ethernet'}); return; }
+  if (name === 'title:list:playable') { sendBridgeEvent({name,dest:'client',titles:[]}); return; }
+  if (name.startsWith('nav:')) { shellState.lastNavigation = msg.path || msg.url || ROOT_URL; return; }
+  if (name === 'email:compose') { const to=encodeURIComponent(data.to||''), subject=encodeURIComponent(data.subject||''), body=encodeURIComponent(data.body||''); await shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(()=>{}); return; }
+  if (name === 'nav:share') { const text=data.text||data.url||''; if(text){await require('electron').clipboard.writeText(text).catch(()=>{}); if(mainWindow&&!mainWindow.isDestroyed()) new Notification({title:'Libby',body:'Link copied to the clipboard.'}).show();} return; }
   if (name === 'ui:haptics') return;
-
-  if (name === 'notifier:schedule') {
-    const title = data.title || 'Libby';
-    const body = data.body || data.message || '';
-    const delay = Math.max(0, Number(data.delayMs || data.delay || 0));
-    setTimeout(() => {
-      if (Notification.isSupported()) new Notification({ title, body }).show();
-    }, delay);
-    return;
-  }
-
-  if (name === 'audioproxy:configure') {
-    sendShellEvent({ name, dest: 'bifocal', volume: 1, playbackRate: 1 });
-    return;
-  }
+  if (name === 'notifier:schedule') { const title=data.title||'Libby', body=data.body||data.message||'', delay=Math.max(0,Number(data.delayMs||data.delay||0)); setTimeout(()=>{if(Notification.isSupported()) new Notification({title,body}).show();},delay); return; }
+  if (name === 'audioproxy:configure') { sendBridgeEvent({name,dest:'bifocal',volume:1,playbackRate:1}); }
 }
+function sendBridgeEvent(payload) { if(mainWindow&&!mainWindow.isDestroyed()) mainWindow.webContents.send('libby-bridge-receive',payload); }
+function sendStartupEvents() { sendBridgeEvent(platformTraits()); sendBridgeEvent({name:'network:info',dest:'client',reachable:true,metered:false,connection:'ethernet'}); sendBridgeEvent({name:'title:list:playable',dest:'client',subscribe:true}); }
 
 function createWindow() {
   const partition = 'persist:libby';
@@ -158,7 +78,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition,
-      contextIsolation: true,
+      contextIsolation: false,
       sandbox: false,
       nodeIntegration: false,
       spellcheck: true,
@@ -228,10 +148,11 @@ function createWindow() {
     }
   });
 
+  mainWindow.webContents.on('did-finish-load', () => { sendStartupEvents(); });
   mainWindow.webContents.on('did-navigate', (_event, url) => { shellState.lastNavigation = url; });
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.on('closed', () => { mainWindow = null; });
-  ses.clearCache().catch(() => {}).finally(() => mainWindow.loadURL(ROOT_URL));
+  mainWindow.loadURL(ROOT_URL);
 
   // Windows media keys: ask the page's Media Session implementation to handle them.
   const mediaCommands = {
@@ -247,8 +168,7 @@ function createWindow() {
 
 ipcMain.handle('bridge-capabilities', () => capabilities());
 ipcMain.handle('bridge-environment', () => ENVIRONMENT);
-ipcMain.handle('bridge-shell-message', (_event, raw) => handleShellMessage(raw));
-ipcMain.on('bridge-shell-message-sync', (_event, raw) => { handleShellMessage(raw).catch(() => {}); });
+ipcMain.on('bridge-shell-message', (_event, raw) => { void handleShellMessage(raw); });
 ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir() }));
 ipcMain.handle('open-external', (_event, url) => shell.openExternal(url));
 
