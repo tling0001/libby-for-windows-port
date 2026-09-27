@@ -162,19 +162,46 @@ function createSplashWindow() {
     skipTaskbar: true, transparent: false, focusable: true,
     webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
   });
-  splashWindow.setAlwaysOnTop(true, 'screen-saver');
+  // Keep the splash above the app only while it is actually being shown.  The
+  // previous implementation used the screen-saver z-order, which could leave
+  // a dead splash permanently above the real window if its close callback was
+  // interrupted.
+  splashWindow.setAlwaysOnTop(true, 'floating');
   splashWindow.loadFile(path.join(__dirname, 'splash.html'));
-  splashWindow.once('ready-to-show', () => splashWindow.show());
+  splashWindow.once('ready-to-show', () => {
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
+  });
+  splashWindow.webContents.on('before-input-event', (_event, input) => {
+    if (input.key === 'Escape' && input.type === 'keyDown') closeSplash(true);
+  });
   splashWindow.on('closed', () => { splashWindow = null; });
 }
 
-function closeSplash() {
-  if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
-  if (splashWindow && !splashWindow.isDestroyed()) {
-    splashWindow.webContents.executeJavaScript(`document.body.style.transition='opacity .28s ease';document.body.style.opacity='0';`).catch(() => {});
-    setTimeout(() => { if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close(); }, 300);
+function closeSplash(immediate = false) {
+  const splash = splashWindow;
+  if (!splash || splash.isDestroyed()) {
+    splashWindow = null;
+    return;
   }
-  splashWindow = null;
+  // Do NOT null the global reference before the delayed close. That was the
+  // v5 bug: the timeout checked splashWindow after it had already been set to
+  // null, so the fullscreen window could never actually close.
+  splashWindow = splash;
+  try { splash.setAlwaysOnTop(false); } catch {}
+  if (immediate) {
+    try { splash.destroy(); } catch {}
+    if (splashWindow === splash) splashWindow = null;
+    return;
+  }
+  splash.webContents.executeJavaScript(
+    `document.body.style.transition='opacity .20s ease';document.body.style.opacity='0';`
+  ).catch(() => {});
+  setTimeout(() => {
+    if (!splash.isDestroyed()) {
+      try { splash.close(); } catch { try { splash.destroy(); } catch {} }
+    }
+    if (splashWindow === splash) splashWindow = null;
+  }, 240);
 }
 
 function showBootFailure(error) {
@@ -354,6 +381,13 @@ function configureWebContents(contents) {
 function setupSession(ses) {
   libbySession = ses;
   ses.setUserAgent(APP_USER_AGENT, 'en-US,en');
+  ses.setPermissionRequestHandler((_webContents, permission, callback) => {
+    // Android requests these through its native WebChromeClient/permission
+    // layer. On Windows, Chromium can satisfy the equivalent permissions in
+    // the persistent Libby session.
+    const allowed = new Set(['geolocation', 'notifications', 'media', 'fullscreen']);
+    callback(allowed.has(permission));
+  });
   // Android WebView supplies the application's package in X-Requested-With.
   // Libby's native shell can use this as part of its WebView/runtime detection.
   try {
@@ -1042,17 +1076,38 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
-    // Android's launch screen belongs to the launch window and disappears as
-    // soon as Activity_Main is visible. Do the same on Windows rather than
-    // waiting for a later renderer event.
+    // Android's launch screen belongs to the Activity and disappears when the
+    // Activity's content becomes visible. Do not tie this to the remote Libby
+    // bootstrap completing: a broken web bootstrap must still leave the user
+    // able to see and diagnose the real loading page.
     closeSplash();
   });
+  // Electron may delay ready-to-show for a remote page with a slow renderer.
+  // Android would already have dismissed its OS splash by this point, so make
+  // the Windows splash have the same bounded lifetime. This also guarantees
+  // the user can see the actual Libby loading screen.
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!mainWindow.isVisible()) mainWindow.show();
+      closeSplash();
+    }
+  }, 1800);
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
   bootTimer = setTimeout(() => {
     if (!bootCompleted && mainWindow && !mainWindow.isDestroyed()) {
-      diagnostic('boot:timeout', { url: mainWindow.webContents.getURL(), readyState: 'unknown', ua: mainWindow.webContents.getUserAgent() });
-      showBootFailure('Startup timed out before Libby finished loading.');
+      diagnostic('boot:timeout', {
+        url: mainWindow.webContents.getURL(),
+        readyState: 'unknown',
+        ua: mainWindow.webContents.getUserAgent()
+      });
+      // Do not replace Libby's page with our recovery page. Android keeps the
+      // WebView visible and its own recovery logic decides what to display.
+      // Replacing it here can hide the real failure and makes diagnosis harder.
+      sendClientEvent({
+        name: 'client:view:failure', dest: 'client',
+        error: 'Windows host boot timeout; Libby WebView remains visible for diagnosis.'
+      });
     }
   }, 30000);
 
