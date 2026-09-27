@@ -1,18 +1,43 @@
-const { app, BrowserWindow, session, shell, ipcMain, dialog, Notification, nativeTheme, globalShortcut, Menu } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  session,
+  shell,
+  ipcMain,
+  dialog,
+  Notification,
+  nativeTheme,
+  globalShortcut,
+  Menu,
+  clipboard
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 
 const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
-const PRODUCT = 'Libby';
+const PRODUCT = 'Dewey';
+const SPEC = 'V32';
 const ENVIRONMENT = 'charlie';
 const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
 
-let mainWindow;
+// Electron documents app.userAgentFallback as the global fallback. Setting it
+// before ready also covers child windows/popups; the persistent Libby session
+// is set explicitly below as well.
+app.userAgentFallback = APP_USER_AGENT;
+
+let mainWindow = null;
+let bifocalWindow = null;
+let authWindow = null;
+let libbySession = null;
 let shellState = { lastNavigation: ROOT_URL };
+let notifications = new Map();
+let nextNotificationId = 1;
 
 function dataDir() {
-  return path.join(app.getPath('userData'), 'libby');
+  const p = path.join(app.getPath('userData'), 'libby');
+  fs.mkdirSync(p, { recursive: true });
+  return p;
 }
 
 function downloadsDir() {
@@ -21,15 +46,59 @@ function downloadsDir() {
   return p;
 }
 
-function sendShellEvent(payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('libby-shell-event', payload);
+function diagnosticsDir() {
+  const p = path.join(dataDir(), 'diagnostics');
+  fs.mkdirSync(p, { recursive: true });
+  return p;
 }
 
-function platformTraits() {
+function diagnosticsFile() {
+  return path.join(diagnosticsDir(), 'libby-windows.log');
+}
+
+function diagnostic(type, data = {}) {
+  try {
+    fs.appendFileSync(diagnosticsFile(), JSON.stringify({
+      time: new Date().toISOString(),
+      type,
+      ...data
+    }) + '\n');
+  } catch {}
+}
+
+function safeJson(value) {
+  try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
+}
+
+function targetWindowFor(dest, sourceContents = null) {
+  if (dest === 'bifocal' && bifocalWindow && !bifocalWindow.isDestroyed()) return bifocalWindow;
+  if (dest === 'auth' && authWindow && !authWindow.isDestroyed()) return authWindow;
+  if (dest === 'client' && mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+
+  // When the Android code routes an event to a specific destination, prefer
+  // that destination. For generic shell replies, reply to the initiating view.
+  for (const win of [mainWindow, bifocalWindow, authWindow]) {
+    if (win && !win.isDestroyed() && sourceContents && win.webContents.id === sourceContents.id) return win;
+  }
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+
+function sendShellEvent(payload, sourceContents = null) {
+  const dest = payload && payload.dest;
+  const target = targetWindowFor(dest, sourceContents);
+  if (!target || target.isDestroyed()) return;
+  target.webContents.send('libby-shell-event', safeJson(payload));
+}
+
+function sendClientEvent(payload) {
+  if (!payload.dest) payload.dest = 'client';
+  sendShellEvent(payload);
+}
+
+function platformTraits(dest = 'client') {
   return {
     name: 'platform:traits',
-    dest: 'client',
+    dest,
     device: {
       brand: 'Microsoft',
       model: 'Windows PC',
@@ -43,11 +112,20 @@ function platformTraits() {
       highContrast: false,
       storagePath: dataDir(),
       installer: 'electron',
-      language: { app: app.getLocale(), system: app.getLocale() }
+      language: {
+        app: app.getLocale(),
+        system: app.getLocale()
+      },
+      powerMode: 'normal',
+      backgroundActivity: true,
+      bankWrittenByAnotherInstance: false,
+      errorCorrelationId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     }
   };
 }
 
+// This starts from the Android 9.5.0 resource string, then applies the same
+// runtime overrides cp1.capabilities() applies on Android.
 function capabilities() {
   return JSON.stringify({
     bank: true,
@@ -74,74 +152,572 @@ function capabilities() {
     'notifier:receive': true,
     'ui:passkey': true,
     'audio:speech-synthesis': { supported: true, resumable: false },
-    'platform:referrer': ['install', 'session']
+    'dervish:activity': { pending: true },
+    'platform:referrer': ['install', 'session'],
+    'diagnostics:platform-settings': [
+      'app',
+      'app-geolocation-permissions',
+      'app-notifications',
+      'network',
+      'app-language'
+    ]
   });
 }
 
-async function handleShellMessage(raw) {
+function networkInfo(dest = 'client') {
+  return {
+    name: 'network:info',
+    dest,
+    reachable: true,
+    metered: false,
+    connection: 'ethernet'
+  };
+}
+
+function isTrustedLibbyUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && (
+      u.hostname === 'libbyapp.com' ||
+      u.hostname.endsWith('.libbyapp.com') ||
+      u.hostname === 'overdrive.com' ||
+      u.hostname.endsWith('.overdrive.com')
+    );
+  } catch { return false; }
+}
+
+function configureWebContents(contents) {
+  contents.setUserAgent(APP_USER_AGENT);
+
+  contents.on('did-start-navigation', (_event, url) => {
+    diagnostic('navigation:start', { url });
+  });
+  contents.on('did-finish-load', () => {
+    diagnostic('navigation:finish', { url: contents.getURL() });
+  });
+  contents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    diagnostic('navigation:fail', { errorCode, errorDescription, validatedURL, isMainFrame });
+    if (isMainFrame) {
+      sendClientEvent({
+        name: contents === (bifocalWindow && bifocalWindow.webContents) ? 'bifocal:view:failure' : 'client:view:failure',
+        dest: contents === (bifocalWindow && bifocalWindow.webContents) ? 'bifocal' : 'client',
+        error: errorDescription || `WebView load failed (${errorCode})`
+      });
+    }
+  });
+  contents.on('render-process-gone', (_event, details) => {
+    diagnostic('renderer:gone', { reason: details.reason, exitCode: details.exitCode });
+  });
+
+  contents.setWindowOpenHandler(({ url }) => {
+    if (isTrustedLibbyUrl(url)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1100,
+          height: 800,
+          webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            partition: 'persist:libby',
+            contextIsolation: true,
+            sandbox: false,
+            nodeIntegration: false
+          }
+        }
+      };
+    }
+    shell.openExternal(url).catch(() => {});
+    return { action: 'deny' };
+  });
+
+  contents.on('will-navigate', (event, url) => {
+    if (!isTrustedLibbyUrl(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+    }
+  });
+}
+
+function setupSession(ses) {
+  libbySession = ses;
+  ses.setUserAgent(APP_USER_AGENT, 'en-US,en');
+
+  // Persist cookies, IndexedDB, service workers, cache and local storage in the
+  // same session. This is the closest Windows equivalent of Android WebView's
+  // persistent Libby profile.
+  ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const allowed = new Set([
+      'geolocation',
+      'notifications',
+      'media',
+      'clipboard-read',
+      'clipboard-sanitized-write',
+      'fullscreen'
+    ]);
+    const origin = details?.requestingUrl || webContents?.getURL?.() || '';
+    const trusted = /^https:\/\/(?:[^/]+\.)?(?:libbyapp\.com|overdrive\.com)\//i.test(origin);
+    callback(trusted && allowed.has(permission));
+  });
+
+  ses.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+    const trusted = /^https:\/\/(?:[^/]+\.)?(?:libbyapp\.com|overdrive\.com)$/i.test(requestingOrigin || '') ||
+      /^https:\/\/(?:[^/]+\.)?(?:libbyapp\.com|overdrive\.com)\//i.test(requestingOrigin || '');
+    return trusted && ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen'].includes(permission);
+  });
+
+  ses.on('will-download', (event, item, webContents) => {
+    const filename = item.getFilename();
+    const target = path.join(downloadsDir(), filename);
+    item.setSavePath(target);
+    diagnostic('download:start', { filename, target, url: item.getURL() });
+    item.on('updated', (_event, state) => {
+      diagnostic('download:update', { filename, state, received: item.getReceivedBytes(), total: item.getTotalBytes() });
+    });
+    item.once('done', (_event, state) => {
+      diagnostic('download:done', { filename, state, target });
+      if (state === 'completed' && Notification.isSupported()) {
+        new Notification({ title: 'Libby download complete', body: filename }).show();
+      }
+    });
+  });
+
+  ses.on('select-client-certificate', (event, webContents, url, list, callback) => {
+    // Preserve Chromium's normal client-certificate UI/behavior rather than
+    // silently selecting a certificate.
+    if (list.length === 1) {
+      event.preventDefault();
+      callback(list[0]);
+    }
+  });
+
+  // Let Chromium/WebAuthn handle platform/roaming authenticators. If multiple
+  // discoverable credentials exist, choose the first one only when the user has
+  // no browser account picker available; otherwise cancel rather than guessing.
+  ses.on('select-webauthn-account', (_event, details, callback) => {
+    if (details.accounts?.length === 1) callback(details.accounts[0].credentialId);
+    else callback();
+  });
+}
+
+function openAuthWindow(msg, sourceContents) {
+  const data = msg;
+  if (authWindow && !authWindow.isDestroyed()) {
+    authWindow.show();
+    if (data.url) authWindow.loadURL(data.url, { userAgent: APP_USER_AGENT });
+    return;
+  }
+
+  authWindow = new BrowserWindow({
+    width: 900,
+    height: 760,
+    minWidth: 600,
+    minHeight: 500,
+    parent: mainWindow || undefined,
+    modal: false,
+    show: false,
+    title: data['text-title'] || 'Sign In',
+    icon: path.join(__dirname, '..', 'assets', 'libby.ico'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      partition: 'persist:libby',
+      contextIsolation: true,
+      sandbox: false,
+      nodeIntegration: false
+    }
+  });
+  configureWebContents(authWindow.webContents);
+  authWindow.once('ready-to-show', () => authWindow.show());
+  authWindow.on('closed', () => {
+    authWindow = null;
+    sendClientEvent({ name: 'authentication:cancelled', dest: 'client' });
+  });
+  if (data.url) authWindow.loadURL(data.url, { userAgent: APP_USER_AGENT });
+  else authWindow.loadURL('about:blank');
+  diagnostic('auth:open', { url: data.url || '' });
+}
+
+function openBifocalWindow(msg) {
+  if (!bifocalWindow || bifocalWindow.isDestroyed()) {
+    bifocalWindow = new BrowserWindow({
+      width: 1100,
+      height: 820,
+      minWidth: 700,
+      minHeight: 500,
+      parent: mainWindow || undefined,
+      show: false,
+      title: 'Libby Reader',
+      icon: path.join(__dirname, '..', 'assets', 'libby.ico'),
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        partition: 'persist:libby',
+        contextIsolation: true,
+        sandbox: false,
+        nodeIntegration: false
+      }
+    });
+    configureWebContents(bifocalWindow.webContents);
+    bifocalWindow.loadURL('about:blank');
+    bifocalWindow.on('closed', () => { bifocalWindow = null; });
+  }
+
+  const url = msg.url || msg.openbookURL || '';
+  if (url) {
+    bifocalWindow.loadURL(url, { userAgent: APP_USER_AGENT });
+  }
+  if (msg.reveal !== false) bifocalWindow.show();
+  diagnostic('bifocal:open', { url, openbookURL: msg.openbookURL || '' });
+}
+
+function hideWindow(win) {
+  if (win && !win.isDestroyed()) win.hide();
+}
+
+function showWindow(win) {
+  if (win && !win.isDestroyed()) { win.show(); win.focus(); }
+}
+
+function injectBridgeBootSignals(win, dest) {
+  if (!win || win.isDestroyed()) return;
+  setTimeout(() => {
+    if (!win.isDestroyed()) {
+      sendShellEvent(platformTraits(dest));
+      sendShellEvent(networkInfo(dest));
+    }
+  }, 100);
+}
+
+function executePage(win, code) {
+  if (!win || win.isDestroyed()) return Promise.resolve(undefined);
+  return win.webContents.executeJavaScript(code, true).catch((error) => {
+    diagnostic('execute-js:error', { error: String(error), url: win.webContents.getURL() });
+    return undefined;
+  });
+}
+
+function b64urlToBytes(value) {
+  if (typeof value !== 'string') return value;
+  try {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
+    return Array.from(Buffer.from(normalized, 'base64'));
+  } catch { return value; }
+}
+
+function convertWebAuthnRequest(value) {
+  if (!value || typeof value !== 'object') return value;
+  const out = { ...value };
+  if (typeof out.challenge === 'string') out.challenge = b64urlToBytes(out.challenge);
+  if (out.user && typeof out.user === 'object' && typeof out.user.id === 'string') out.user = { ...out.user, id: b64urlToBytes(out.user.id) };
+  for (const key of ['allowCredentials', 'excludeCredentials']) {
+    if (Array.isArray(out[key])) out[key] = out[key].map((x) => ({ ...x, id: typeof x.id === 'string' ? b64urlToBytes(x.id) : x.id }));
+  }
+  return out;
+}
+
+function bytesToB64url(value) {
+  if (!value) return '';
+  return Buffer.from(new Uint8Array(value)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function webAuthnPageScript(mode, request) {
+  const requestJson = JSON.stringify(convertWebAuthnRequest(request)).replace(/</g, '\\u003c');
+  const name = mode === 'register' ? 'ui:passkey:register' : 'ui:passkey:authenticate';
+  const responseName = mode === 'register' ? 'ui:passkey:register' : 'ui:passkey:authenticate';
+  return `(async()=>{\n` +
+    `const req=${requestJson};\n` +
+    `const b64=(x)=>{if(!x)return '';try{const a=new Uint8Array(x);let s='';for(let i=0;i<a.length;i+=0x8000)s+=String.fromCharCode(...a.subarray(i,i+0x8000));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,'')}catch(e){return ''}};\n` +
+    `try{\n` +
+    ` const publicKey=req;\n` +
+    ` const cred=${mode === 'register' ? `await navigator.credentials.create({publicKey})` : `await navigator.credentials.get({publicKey})`};\n` +
+    ` if(!cred)throw new DOMException('No credential returned','NotAllowedError');\n` +
+    ` const r=cred.response;\n` +
+    ` const credential={id:cred.id,rawId:b64(cred.rawId),type:cred.type,response:{}};\n` +
+    ` if(${mode === 'register'}){credential.response={clientDataJSON:b64(r.clientDataJSON),attestationObject:b64(r.attestationObject),transports:(r.getTransports?r.getTransports():undefined)}}\n` +
+    ` else{credential.response={clientDataJSON:b64(r.clientDataJSON),authenticatorData:b64(r.authenticatorData),signature:b64(r.signature),userHandle:r.userHandle?b64(r.userHandle):null}}\n` +
+    ` window.dispatchEvent(new CustomEvent('bridge:receive',{detail:{name:'${responseName}',dest:'client',credential}}));\n` +
+    `}catch(e){window.dispatchEvent(new CustomEvent('bridge:receive',{detail:{name:'ui:passkey:failure',dest:'client',reason:String(e&&e.message||e)}}));}\n` +
+    `})()`;
+}
+
+async function handlePasskey(msg, sourceContents) {
+  const sourceWin = [mainWindow, bifocalWindow, authWindow].find((w) => w && !w.isDestroyed() && w.webContents.id === sourceContents?.id) || mainWindow;
+  const mode = msg.name === 'ui:passkey:register' ? 'register' : 'authenticate';
+  const request = msg.webauthnRequest || msg.request || msg.options || {};
+  if (!request || typeof request !== 'object') {
+    sendShellEvent({ name: 'ui:passkey:failure', dest: 'client', reason: 'Missing webauthnRequest' }, sourceContents);
+    return;
+  }
+  diagnostic('passkey:request', { mode });
+  await executePage(sourceWin, webAuthnPageScript(mode, request));
+}
+
+function scheduleNotification(data) {
+  const id = String(data.id || `libby-${nextNotificationId++}`);
+  const delay = Math.max(0, Number(data.delayMs ?? data.delay ?? 0));
+  const timer = setTimeout(() => {
+    notifications.delete(id);
+    if (Notification.isSupported()) {
+      const n = new Notification({
+        title: data.title || 'Libby',
+        body: data.body || data.message || '',
+        silent: !!data.silent
+      });
+      n.on('click', () => sendClientEvent({ name: 'notifier:receive', dest: 'client', id, action: 'click' }));
+      n.show();
+    }
+    sendClientEvent({ name: 'notifier:receive', dest: 'client', id, notification: safeJson(data) });
+  }, delay);
+  notifications.set(id, timer);
+  return id;
+}
+
+async function handleShellMessage(raw, sourceContents) {
   let msg;
-  try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return; }
+  try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) {
+    diagnostic('bridge:parse-error', { raw: String(raw), error: String(e) });
+    return;
+  }
   if (!msg || typeof msg !== 'object') return;
 
   const name = msg.name || '';
-  const data = msg.data || msg;
+  const data = msg.data && typeof msg.data === 'object' ? { ...msg, ...msg.data } : msg;
+  diagnostic('bridge:message', { name, dest: msg.dest || '', keys: Object.keys(msg) });
 
   if (name === 'platform:traits') {
-    sendShellEvent(platformTraits());
+    sendShellEvent(platformTraits(msg.dest || 'client'), sourceContents);
     return;
   }
 
   if (name === 'network:info') {
-    sendShellEvent({ name, dest: msg.dest || 'client', reachable: true, metered: false, connection: 'ethernet' });
+    sendShellEvent(networkInfo(msg.dest || 'client'), sourceContents);
     return;
   }
 
-  if (name.startsWith('nav:')) {
-    shellState.lastNavigation = msg.path || msg.url || ROOT_URL;
+  if (name === 'geolocation:coordinates') {
+    const target = targetWindowFor('client', sourceContents);
+    if (!target) return;
+    const script = `(function(){return new Promise(r=>{if(!navigator.geolocation){r({failure:'geolocation unavailable'});return;}navigator.geolocation.getCurrentPosition(p=>r({latitude:p.coords.latitude,longitude:p.coords.longitude}),e=>r({failure:e.message||'geolocation failed'}),{enableHighAccuracy:false,timeout:10000,maximumAge:300000})})})()`;
+    const result = await executePage(target, script);
+    sendShellEvent({ name, dest: 'client', ...(result || { failure: 'geolocation failed' }) }, sourceContents);
+    return;
+  }
+
+  if (name === 'ui:passkey:authenticate' || name === 'ui:passkey:register') {
+    await handlePasskey(msg, sourceContents);
+    return;
+  }
+
+  if (name === 'auth:view:open') {
+    openAuthWindow(msg, sourceContents);
+    return;
+  }
+  if (name === 'auth:view:conceal') {
+    hideWindow(authWindow);
+    return;
+  }
+  if (name === 'auth:view:reveal') {
+    showWindow(authWindow);
+    return;
+  }
+  if (name === 'auth:view:clear') {
+    if (authWindow && !authWindow.isDestroyed()) {
+      authWindow.loadURL('about:blank');
+      hideWindow(authWindow);
+    }
+    return;
+  }
+
+  if (name === 'bifocal:view:open') {
+    openBifocalWindow(msg);
+    return;
+  }
+  if (name === 'bifocal:view:conceal') {
+    hideWindow(bifocalWindow);
+    return;
+  }
+  if (name === 'bifocal:view:reveal') {
+    showWindow(bifocalWindow);
+    return;
+  }
+  if (name === 'bifocal:view:clear') {
+    if (bifocalWindow && !bifocalWindow.isDestroyed()) bifocalWindow.loadURL('about:blank');
+    return;
+  }
+
+  if (name === 'client:view:failure' || name === 'bifocal:view:failure' || name === 'auth:view:failure') {
+    diagnostic(name, { error: msg.error || '' });
+    sendShellEvent(msg, sourceContents);
+    return;
+  }
+
+  if (name === 'diagnostics:client:error') {
+    diagnostic('client:error', { error: msg.error || null, ua: sourceContents?.getUserAgent?.() || APP_USER_AGENT });
+    return;
+  }
+  if (name === 'diagnostics:log:email') {
+    const to = encodeURIComponent(msg.toAddress || '');
+    const subject = encodeURIComponent(msg.subject || 'Libby diagnostics');
+    const body = encodeURIComponent(msg.body || fs.readFileSync(diagnosticsFile(), 'utf8').slice(-20000));
+    shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
+    return;
+  }
+  if (name === 'diagnostics:show') {
+    await shell.openPath(diagnosticsFile()).catch(() => {});
+    return;
+  }
+  if (name === 'diagnostics:platform-settings') {
+    const settings = msg.settings || 'app';
+    const map = {
+      'app-geolocation-permissions': 'ms-settings:privacy-location',
+      'app-notifications': 'ms-settings:notifications',
+      'app-language': 'ms-settings:regionlanguage',
+      network: 'ms-settings:network-status',
+      app: 'ms-settings:appsfeatures'
+    };
+    shell.openExternal(map[settings] || map.app).catch(() => {});
+    return;
+  }
+
+  if (name === 'surface:tint') {
+    if (msg.tint === 'dark' || msg.immersive === true) nativeTheme.themeSource = 'dark';
+    else if (msg.tint === 'light') nativeTheme.themeSource = 'light';
+    sendShellEvent(msg, sourceContents);
+    return;
+  }
+  if (name === 'surface:orientation') {
+    // Desktop windows are resizable; acknowledge the Android command without
+    // pretending Windows has a phone-style orientation lock.
+    sendShellEvent(msg, sourceContents);
+    return;
+  }
+  if (name === 'client:dimensions') {
+    const target = bifocalWindow && !bifocalWindow.isDestroyed() ? bifocalWindow : null;
+    if (target) sendShellEvent({ name, dest: 'bifocal', width: target.getContentBounds().width, height: target.getContentBounds().height }, sourceContents);
+    return;
+  }
+
+  if (name === 'environment:launch') {
+    sendShellEvent({ name: 'environment:ready', dest: 'client' }, sourceContents);
+    return;
+  }
+  if (name === 'environment:ready' || name === 'environment:halt') return;
+
+  if (name === 'platform:referrer') {
+    sendShellEvent({
+      name,
+      dest: msg.dest || 'client',
+      urls: { install: null, session: null }
+    }, sourceContents);
     return;
   }
 
   if (name === 'email:compose') {
-    const to = encodeURIComponent(data.to || '');
+    const to = encodeURIComponent(data.to || data.toAddress || '');
     const subject = encodeURIComponent(data.subject || '');
     const body = encodeURIComponent(data.body || '');
-    await shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
+    shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
     return;
   }
 
   if (name === 'nav:share') {
     const text = data.text || data.url || '';
     if (text) {
-      await require('electron').clipboard.writeText(text).catch(() => {});
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        new Notification({ title: 'Libby', body: 'Link copied to the clipboard.' }).show();
-      }
+      clipboard.writeText(text);
+      if (Notification.isSupported()) new Notification({ title: 'Libby', body: 'Link copied to the clipboard.' }).show();
+    }
+    return;
+  }
+  if (name === 'nav:open' || name === 'nav:back' || name === 'nav:forward' || name.startsWith('nav:')) {
+    shellState.lastNavigation = msg.path || msg.url || shellState.lastNavigation;
+    return;
+  }
+
+  if (name.startsWith('haptic:')) return;
+  if (name === 'ui:haptics') return;
+
+  if (name === 'notifier:permission:check') {
+    sendClientEvent({ name: 'notifier:permission', dest: 'client', granted: Notification.isSupported() });
+    return;
+  }
+  if (name === 'notifier:permission:request') {
+    sendClientEvent({ name: 'notifier:permission', dest: 'client', granted: Notification.isSupported() });
+    return;
+  }
+  if (name === 'notifier:schedule') {
+    const id = scheduleNotification(msg);
+    sendClientEvent({ name: 'notifier:schedule:success', dest: 'client', id });
+    return;
+  }
+  if (name === 'notifier:cancel') {
+    const id = String(msg.id || '');
+    const timer = notifications.get(id);
+    if (timer) clearTimeout(timer);
+    notifications.delete(id);
+    return;
+  }
+  if (name === 'notifier:dismiss' || name === 'notifier:dismiss:all') return;
+  if (name === 'notifier:list') {
+    sendClientEvent({ name: 'notifier:list', dest: 'client', notifications: [] });
+    return;
+  }
+
+  if (name.startsWith('audioproxy:')) {
+    const audioDest = msg.dest || 'bifocal';
+    const target = targetWindowFor(audioDest, sourceContents);
+    if (name === 'audioproxy:configure') {
+      sendShellEvent({ name, dest: audioDest, volume: 1, playbackRate: Number(msg.playbackRate || 1), ...(Object.prototype.hasOwnProperty.call(msg, 'sleepAtPosition') ? { sleepAtPosition: msg.sleepAtPosition } : {}) }, sourceContents);
+      return;
+    }
+    if (target) {
+      sendShellEvent(msg, sourceContents);
     }
     return;
   }
 
-  if (name === 'ui:haptics') return;
-
-  if (name === 'notifier:schedule') {
-    const title = data.title || 'Libby';
-    const body = data.body || data.message || '';
-    const delay = Math.max(0, Number(data.delayMs || data.delay || 0));
-    setTimeout(() => {
-      if (Notification.isSupported()) new Notification({ title, body }).show();
-    }, delay);
+  if (name === 'speechproxy:speak' || name.startsWith('speechproxy:')) {
+    // Windows Chromium's speechSynthesis is the desktop equivalent.
+    sendShellEvent({ name, dest: msg.dest || 'client', supported: true }, sourceContents);
     return;
   }
 
-  if (name === 'audioproxy:configure') {
-    sendShellEvent({ name, dest: 'bifocal', volume: 1, playbackRate: 1 });
-    return;
+  if (name === 'bank:') return;
+  if (name.startsWith('bank:')) return;
+
+  // Android forwards several commands to the shell and echoes/dispatches the
+  // native result. For commands without a Windows-specific implementation,
+  // acknowledge them rather than dropping the message silently.
+  if (msg.dest === 'shell') {
+    sendShellEvent({ ...msg, dest: msg.sourceDest || 'client' }, sourceContents);
+  }
+}
+
+function sendStartupSignals() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Android Activity_Main.A() pushes platform traits to BOTH WebViews on
+  // startup/resume. Doing this proactively is important: the Libby client
+  // should not have to poll for the native environment before it leaves boot.
+  sendShellEvent(platformTraits('client'));
+  sendShellEvent(networkInfo('client'));
+  if (bifocalWindow && !bifocalWindow.isDestroyed()) {
+    sendShellEvent(platformTraits('bifocal'));
+    sendShellEvent(networkInfo('bifocal'));
+  }
+}
+
+function sendMediaKey(key) {
+  const wins = [mainWindow, bifocalWindow].filter((w) => w && !w.isDestroyed());
+  for (const win of wins) {
+    const code = JSON.stringify(key);
+    executePage(win, `(async()=>{\n` +
+      `const k=${code};\n` +
+      `try{if(navigator.mediaSession&&navigator.mediaSession.setActionHandler){const map={playpause:'play',next:'nexttrack',previous:'previoustrack'};if(k==='playpause'){const aud=[...document.querySelectorAll('audio,video')];const a=aud.find(x=>!x.paused)||aud[0];if(a){if(a.paused)await a.play();else a.pause();}}else{try{navigator.mediaSession.setActionHandler(map[k],()=>{})}catch(e){}}}}catch(e){}` +
+      `})()`);
   }
 }
 
 function createWindow() {
   const partition = 'persist:libby';
   const ses = session.fromPartition(partition);
-  ses.setUserAgent(APP_USER_AGENT);
+  setupSession(ses);
 
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -162,6 +738,7 @@ function createWindow() {
       webviewTag: false
     }
   });
+  configureWebContents(mainWindow.webContents);
 
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: 'File', submenu: [
@@ -176,6 +753,7 @@ function createWindow() {
         fs.writeFileSync(filePath, pdf);
       } },
       { type: 'separator' },
+      { label: 'Open diagnostics log', click: () => shell.openPath(diagnosticsFile()) },
       { label: 'Exit', role: 'quit' }
     ]},
     { label: 'View', submenu: [
@@ -189,64 +767,44 @@ function createWindow() {
     ]}
   ]));
 
-  // Downloads: preserve Libby's downloadable content rather than losing it to a browser temp folder.
-  ses.on('will-download', (event, item) => {
-    const filename = item.getFilename();
-    const target = path.join(downloadsDir(), filename);
-    item.setSavePath(target);
-    item.once('done', (_e, state) => {
-      if (state === 'completed' && Notification.isSupported()) {
-        new Notification({ title: 'Libby download complete', body: filename }).show();
-      }
-    });
+  mainWindow.webContents.on('console-message', (_event, details) => {
+    diagnostic('console', { level: details.level, message: details.message, line: details.lineNumber, source: details.sourceId });
   });
 
-  ses.setPermissionRequestHandler((webContents, permission, callback) => {
-    const allowed = ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'];
-    callback(allowed.includes(permission));
+  mainWindow.webContents.on('dom-ready', () => {
+    diagnostic('dom-ready', { url: mainWindow.webContents.getURL(), ua: mainWindow.webContents.getUserAgent() });
+  });
+  mainWindow.webContents.on('did-finish-load', () => {
+    sendStartupSignals();
+    executePage(mainWindow, `window.__LIBBY_WINDOWS_BRIDGE__={version:${JSON.stringify(APP_VERSION)},environment:${JSON.stringify(ENVIRONMENT)}};`);
   });
 
-  ses.setPermissionCheckHandler((_webContents, permission) => {
-    return ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'].includes(permission);
-  });
-
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://libbyapp.com') || url.startsWith('https://www.libbyapp.com')) {
-      return { action: 'allow' };
-    }
-    shell.openExternal(url).catch(() => {});
-    return { action: 'deny' };
-  });
-
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!/^https:\/\/([a-z0-9-]+\.)*libbyapp\.com\//i.test(url) && !/^https:\/\/[^/]*overdrive\.com\//i.test(url)) {
-      event.preventDefault();
-      shell.openExternal(url).catch(() => {});
-    }
-  });
-
-  mainWindow.webContents.on('did-navigate', (_event, url) => { shellState.lastNavigation = url; });
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.loadURL(ROOT_URL);
+  mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
 
-  // Windows media keys: ask the page's Media Session implementation to handle them.
-  const mediaCommands = {
-    MediaPlayPause: `navigator.mediaSession?.setActionHandler ? null : null`,
-    MediaNextTrack: `navigator.mediaSession?.setActionHandler ? null : null`
-  };
   try {
-    globalShortcut.register('MediaPlayPause', () => mainWindow?.webContents.send('libby-media-key', 'playpause'));
-    globalShortcut.register('MediaNextTrack', () => mainWindow?.webContents.send('libby-media-key', 'next'));
-    globalShortcut.register('MediaPreviousTrack', () => mainWindow?.webContents.send('libby-media-key', 'previous'));
-  } catch {}
+    globalShortcut.register('MediaPlayPause', () => sendMediaKey('playpause'));
+    globalShortcut.register('MediaNextTrack', () => sendMediaKey('next'));
+    globalShortcut.register('MediaPreviousTrack', () => sendMediaKey('previous'));
+  } catch (e) { diagnostic('media-key:register-error', { error: String(e) }); }
 }
 
-ipcMain.on('bridge-capabilities-sync', (event) => { event.returnValue = capabilities(); });
-ipcMain.on('bridge-environment-sync', (event) => { event.returnValue = ENVIRONMENT; });
-ipcMain.on('bridge-shell-message', (_event, raw) => { void handleShellMessage(raw); });
-ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir() }));
-ipcMain.handle('open-external', (_event, url) => shell.openExternal(url));
+ipcMain.on('bridge-capabilities-sync', (event) => {
+  event.returnValue = capabilities();
+});
+ipcMain.on('bridge-environment-sync', (event) => {
+  event.returnValue = ENVIRONMENT;
+});
+ipcMain.on('bridge-shell-message', (event, raw) => {
+  void handleShellMessage(raw, event.sender);
+});
+ipcMain.on('renderer-diagnostic', (_event, payload) => diagnostic('renderer', payload || {}));
+ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir(), diagnostics: diagnosticsFile() }));
+ipcMain.handle('open-external', (_event, url) => {
+  if (typeof url === 'string') return shell.openExternal(url);
+  return false;
+});
 
 app.whenReady().then(() => {
   app.setAppUserModelId('com.overdrive.mobile.windows.libby');
@@ -255,4 +813,9 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch {} });
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch {}
+  for (const timer of notifications.values()) clearTimeout(timer);
+  notifications.clear();
+  diagnostic('app:quit');
+});

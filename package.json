@@ -1,6 +1,6 @@
 {
   "name": "libby-windows-port",
-  "version": "9.5.0-windows.1",
+  "version": "9.5.0-windows.2",
   "description": "Windows desktop port of the supplied Libby Android shell, using the Libby web client and a Windows-native Electron host.",
   "main": "src/main.js",
   "author": "Local Windows port",
