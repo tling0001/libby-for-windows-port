@@ -329,6 +329,41 @@ function isTrustedLibbyUrl(url) {
 function configureWebContents(contents) {
   contents.setUserAgent(APP_USER_AGENT);
 
+  // The Android WebView's page world sees an Android-like Navigator. Preload
+  // code runs in an isolated world, so Navigator changes made there would not
+  // be visible to Libby. Inject the compatibility layer into the MAIN world
+  // before any site JavaScript executes.
+  try {
+    contents.addScriptToExecuteOnNewDocument(`(() => {
+      const ua = ${JSON.stringify(APP_USER_AGENT)};
+      try { Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => ua }); } catch {}
+      try { Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Linux armv8l' }); } catch {}
+      try { Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' }); } catch {}
+      try { Object.defineProperty(Navigator.prototype, 'webdriver', { configurable: true, get: () => false }); } catch {}
+      try { Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 5 }); } catch {}
+      try { Object.defineProperty(Navigator.prototype, 'appVersion', { configurable: true, get: () => ua.replace(/^Mozilla\\/5\\.0\\s*/, '') }); } catch {}
+      try {
+        const brands = [
+          { brand: 'Not:A Brand', version: '99' },
+          { brand: 'Chromium', version: '140' },
+          { brand: 'Google Chrome', version: '140' }
+        ];
+        const data = {
+          brands, mobile: true, platform: 'Android',
+          getHighEntropyValues: async () => ({ brands, mobile: true, platform: 'Android', platformVersion: '15', architecture: 'arm', bitness: '64', model: '', uaFullVersion: '140.0.0.0' })
+        };
+        Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => data });
+      } catch {}
+      try {
+        if (!navigator.connection) {
+          Object.defineProperty(Navigator.prototype, 'connection', { configurable: true, get: () => ({ type: 'wifi', effectiveType: '4g', downlink: 10, rtt: 50, saveData: false }) });
+        }
+      } catch {}
+    })();`);
+  } catch (e) {
+    diagnostic('navigator-compat:setup-error', { error: String(e) });
+  }
+
   contents.on('did-start-navigation', (_event, url) => {
     diagnostic('navigation:start', { url });
   });
@@ -350,30 +385,44 @@ function configureWebContents(contents) {
   });
 
   contents.setWindowOpenHandler(({ url }) => {
-    if (isTrustedLibbyUrl(url)) {
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: {
-          width: 1100,
-          height: 800,
-          webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
-            partition: 'persist:libby',
-            contextIsolation: false,
-            sandbox: false,
-            nodeIntegration: false
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            width: 1100,
+            height: 800,
+            webPreferences: {
+              preload: path.join(__dirname, 'preload.js'),
+              partition: 'persist:libby',
+              contextIsolation: true,
+              sandbox: false,
+              nodeIntegration: false
+            }
           }
-        }
-      };
-    }
+        };
+      }
+    } catch {}
     shell.openExternal(url).catch(() => {});
     return { action: 'deny' };
   });
 
   contents.on('will-navigate', (event, url) => {
-    if (!isTrustedLibbyUrl(url)) {
+    // Android's jp1 WebViewClient allows the Libby web app to follow its own
+    // HTTPS redirects. Do not restrict top-level navigation to a guessed host
+    // allow-list: identity/auth/CDN redirects can legitimately use another
+    // HTTPS origin. Only hand non-web schemes to Windows.
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        diagnostic('navigation:allow', { url });
+        return;
+      }
       event.preventDefault();
       shell.openExternal(url).catch(() => {});
+    } catch {
+      event.preventDefault();
     }
   });
 }
@@ -493,7 +542,7 @@ function openAuthWindow(msg, sourceContents) {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition: 'persist:libby',
-      contextIsolation: false,
+      contextIsolation: true,
       sandbox: false,
       nodeIntegration: false
     }
@@ -523,7 +572,7 @@ function openBifocalWindow(msg) {
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         partition: 'persist:libby',
-        contextIsolation: false,
+        contextIsolation: true,
         sandbox: false,
         nodeIntegration: false
       }
@@ -829,6 +878,22 @@ async function handleShellMessage(raw, sourceContents) {
     return;
   }
 
+  if (name === 'ui:oauth:request') {
+    const url = String(data.url || '');
+    if (url) {
+      shell.openExternal(url).catch(() => {});
+      shellState.oauthActive = true;
+    }
+    return;
+  }
+  if (name === 'feedback:store:rate' || name === 'feedback:store:review') {
+    // Android opens the Play Store when available. Windows has no equivalent
+    // Play Store target, so acknowledge the native command without blocking the
+    // Libby client.
+    diagnostic(name, { requested: true });
+    return;
+  }
+
   if (name === 'surface:tint') {
     if (msg.tint === 'dark' || msg.immersive === true) nativeTheme.themeSource = 'dark';
     else if (msg.tint === 'light') nativeTheme.themeSource = 'light';
@@ -1023,7 +1088,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition,
-      contextIsolation: false,
+      contextIsolation: true,
       sandbox: false,
       nodeIntegration: false,
       spellcheck: true,
@@ -1066,12 +1131,14 @@ function createWindow() {
   mainWindow.webContents.on('dom-ready', () => {
     diagnostic('dom-ready', { url: mainWindow.webContents.getURL(), ua: mainWindow.webContents.getUserAgent() });
     sendStartupSignals();
+    sendShellEvent({ name: 'platform:traits', dest: 'client' });
+    sendShellEvent({ name: 'network:info', dest: 'client' });
     executePage(mainWindow, `(function(){ return { bridge: !!window.BRIDGE, caps: !!(window.BRIDGE && window.BRIDGE.capabilities), env: !!(window.BRIDGE && window.BRIDGE.environment), send: !!(window.BRIDGE && window.BRIDGE.clientToShellAsJSON), ua: navigator.userAgent, webdriver: !!navigator.webdriver }; })()`)
       .then(result => diagnostic('bridge:page-check', result || {}));
   });
   mainWindow.webContents.on('did-finish-load', () => {
     sendStartupSignals();
-    [50, 250, 1000, 3000].forEach((delay) => setTimeout(() => {
+    [50, 250, 1000, 3000, 6000, 10000].forEach((delay) => setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) sendStartupSignals();
     }, delay));
     executePage(mainWindow, `window.__LIBBY_WINDOWS_BRIDGE__={version:${JSON.stringify(APP_VERSION)},environment:${JSON.stringify(ENVIRONMENT)},native:true};`);
@@ -1120,7 +1187,19 @@ function createWindow() {
         error: 'Windows host boot timeout; Libby WebView remains visible for diagnosis.'
       });
     }
-  }, 30000);
+  }, 35000);
+
+  // Android's Fragment_WebView starts a 35-second environment check. If the
+  // client never establishes the environment handshake, it replaces the page
+  // with its troubleshooting screen. Keep that behavior visible instead of
+  // leaving an unexplained permanent loading spinner.
+  setTimeout(() => {
+    if (!bootCompleted && mainWindow && !mainWindow.isDestroyed()) {
+      diagnostic('android:environment-check-failed', { url: mainWindow.webContents.getURL() });
+      const detail = encodeURIComponent('Libby did not complete its environment handshake within 35 seconds.');
+      mainWindow.loadFile(path.join(__dirname, 'retry.html'), { search: `?error=${detail}` }).catch(() => {});
+    }
+  }, 35000);
 
   try {
     globalShortcut.register('MediaPlayPause', () => sendMediaKey('playpause'));

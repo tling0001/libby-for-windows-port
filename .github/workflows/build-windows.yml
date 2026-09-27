@@ -35,10 +35,7 @@ jobs:
         with:
           name: Libby-Windows
           path: |
-            dist/*.exe
-            dist/*.msi
             dist/*.zip
-            dist/*.blockmap
           if-no-files-found: warn
 
       - name: Create GitHub Release
@@ -46,8 +43,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.exe
-            dist/*.msi
             dist/*.zip
-            dist/*.blockmap
           generate_release_notes: true

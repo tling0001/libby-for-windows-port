@@ -31,13 +31,13 @@ npm install
 npm run start
 ```
 
-Create a Windows installer and portable build:
+Create the Windows ZIP distribution (no self-extracting portable EXE):
 
 ```powershell
 npm run dist
 ```
 
-Outputs are placed in `dist\\`.
+The output is a ZIP containing the Windows application files. Extract the ZIP to a folder and run the Libby executable from that folder. This avoids the portable target's self-extraction delay.
 
 ## Architecture
 
