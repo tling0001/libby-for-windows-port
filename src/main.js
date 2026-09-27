@@ -19,7 +19,8 @@ const APP_VERSION = '9.5.0';
 const PRODUCT = 'Dewey';
 const SPEC = 'V32';
 const ENVIRONMENT = 'charlie';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
+const APP_CHROME_VERSION = '140.0.0.0';
+const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${APP_CHROME_VERSION} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
 
 // Electron documents app.userAgentFallback as the global fallback. Setting it
 // before ready also covers child windows/popups; the persistent Libby session
@@ -153,12 +154,15 @@ function handleBankMessage(msg) {
 
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return;
+  const display = require('electron').screen.getPrimaryDisplay();
+  const { x, y, width, height } = display.bounds;
   splashWindow = new BrowserWindow({
-    width: 430, height: 330, frame: false, resizable: false, movable: false,
-    center: true, alwaysOnTop: true, show: false, backgroundColor: '#111111',
-    skipTaskbar: true, transparent: false,
+    x, y, width, height, frame: false, resizable: false, movable: false,
+    fullscreen: true, alwaysOnTop: true, show: false, backgroundColor: '#111111',
+    skipTaskbar: true, transparent: false, focusable: true,
     webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
   });
+  splashWindow.setAlwaysOnTop(true, 'screen-saver');
   splashWindow.loadFile(path.join(__dirname, 'splash.html'));
   splashWindow.once('ready-to-show', () => splashWindow.show());
   splashWindow.on('closed', () => { splashWindow = null; });
@@ -357,6 +361,16 @@ function setupSession(ses) {
       details.requestHeaders['User-Agent'] = APP_USER_AGENT;
       details.requestHeaders['X-Requested-With'] = 'com.overdrive.mobile.android.libby';
       details.requestHeaders['Accept-Language'] = app.getLocale() || 'en-US';
+      // Android WebView does not identify itself as Electron through UA Client
+      // Hints. Remove Electron-generated hints and provide ordinary Chrome/
+      // Windows hints instead. This is important because changing only the UA
+      // string still leaves Sec-CH-UA available to the server.
+      for (const key of Object.keys(details.requestHeaders)) {
+        if (/^sec-ch-ua/i.test(key)) delete details.requestHeaders[key];
+      }
+      details.requestHeaders['Sec-CH-UA'] = '"Chromium";v="140", "Google Chrome";v="140"';
+      details.requestHeaders['Sec-CH-UA-Mobile'] = '?0';
+      details.requestHeaders['Sec-CH-UA-Platform'] = '"Windows"';
       callback({ requestHeaders: details.requestHeaders });
     });
   } catch (e) { diagnostic('webrequest:setup-error', { error: String(e) }); }
@@ -794,10 +808,29 @@ async function handleShellMessage(raw, sourceContents) {
   }
 
   if (name === 'environment:launch') {
-    sendShellEvent({ name: 'environment:ready', dest: 'client' }, sourceContents);
+    // Android's Activity_Main handles environment:launch by reloading the
+    // client WebView; it does NOT answer with environment:ready. Sending a
+    // synthetic ready event here was a behavioral mismatch and can leave the
+    // Libby bootstrap state machine waiting in the wrong state.
+    const win = BrowserWindow.fromWebContents(sourceContents);
+    if (win && win === mainWindow && !win.isDestroyed()) {
+      const now = Date.now();
+      if (!shellState.environmentLaunchAt || now - shellState.environmentLaunchAt > 3000) {
+        shellState.environmentLaunchAt = now;
+        diagnostic('environment:launch', { url: win.webContents.getURL() });
+        win.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
+      }
+    }
     return;
   }
-  if (name === 'environment:ready' || name === 'environment:halt') return;
+  if (name === 'environment:ready') {
+    diagnostic('environment:ready', { dest: msg.dest || '' });
+    return;
+  }
+  if (name === 'environment:halt') {
+    diagnostic('environment:halt', { dest: msg.dest || '' });
+    return;
+  }
 
   if (name === 'platform:referrer') {
     sendShellEvent({
@@ -878,12 +911,20 @@ async function handleShellMessage(raw, sourceContents) {
   }
 
   if (name === 'title:list:playable') {
-    let titles = [];
+    // The Android shell's startup task publishes a subscription marker first;
+    // playable titles are subsequently delivered by the native bank layer.
+    // Do not invent a `titles: []` response because that is not the Android
+    // message shape and can make the client treat the title store as empty.
+    sendShellEvent({ name: 'title:list:playable', subscribe: true, dest: 'client' }, sourceContents);
     try {
       const f = path.join(dataDir(), 'playable-titles.json');
-      if (fs.existsSync(f)) titles = JSON.parse(fs.readFileSync(f, 'utf8')) || [];
-    } catch {}
-    sendShellEvent({ name, dest: 'client', titles }, sourceContents);
+      if (fs.existsSync(f)) {
+        const titles = JSON.parse(fs.readFileSync(f, 'utf8'));
+        if (Array.isArray(titles) && titles.length) {
+          sendShellEvent({ name: 'title:list:playable', dest: 'client', titles }, sourceContents);
+        }
+      }
+    } catch (e) { diagnostic('title:list:playable:error', { error: String(e) }); }
     return;
   }
 
@@ -938,7 +979,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition,
-      contextIsolation: false,
+      contextIsolation: true,
       sandbox: false,
       nodeIntegration: false,
       spellcheck: true,
@@ -980,6 +1021,8 @@ function createWindow() {
 
   mainWindow.webContents.on('dom-ready', () => {
     diagnostic('dom-ready', { url: mainWindow.webContents.getURL(), ua: mainWindow.webContents.getUserAgent() });
+    executePage(mainWindow, `(function(){ return { bridge: !!window.BRIDGE, caps: !!(window.BRIDGE && window.BRIDGE.capabilities), env: !!(window.BRIDGE && window.BRIDGE.environment), send: !!(window.BRIDGE && window.BRIDGE.clientToShellAsJSON), ua: navigator.userAgent, webdriver: !!navigator.webdriver }; })()`)
+      .then(result => diagnostic('bridge:page-check', result || {}));
   });
   mainWindow.webContents.on('did-finish-load', () => {
     sendStartupSignals();
@@ -997,7 +1040,13 @@ function createWindow() {
     if (isMain) showBootFailure(`${desc || 'Navigation failed'} (${code})\n${url || ''}`);
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    // Android's launch screen belongs to the launch window and disappears as
+    // soon as Activity_Main is visible. Do the same on Windows rather than
+    // waiting for a later renderer event.
+    closeSplash();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadURL(ROOT_URL, { userAgent: APP_USER_AGENT });
   bootTimer = setTimeout(() => {

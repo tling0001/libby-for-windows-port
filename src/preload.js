@@ -1,4 +1,4 @@
-const { ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 const CAPABILITIES = JSON.stringify({
   bank: true,
@@ -42,7 +42,7 @@ try {
   Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 0 });
   // Electron exposes Chromium UA Client Hints that can reveal the host even when
   // navigator.userAgent is overridden. Present ordinary Chrome/Windows hints.
-  const chromeMajor = Number(String(process.versions.chrome || '140').split('.')[0]);
+  const chromeMajor = 140;
   const uaData = {
     brands: [
       { brand: 'Chromium', version: String(chromeMajor) },
@@ -60,18 +60,21 @@ try {
     })
   };
   Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => uaData });
+  Object.defineProperty(Navigator.prototype, 'webdriver', { configurable: true, get: () => false });
 } catch {}
 
-window.BRIDGE = {
-  capabilities: function() { return CAPABILITIES; },
-  environment: function() { return ENVIRONMENT; },
+contextBridge.exposeInMainWorld('BRIDGE', {
+  // These MUST remain synchronous. Android's WebView JavascriptInterface
+  // methods return strings directly, and Libby calls them during bootstrap.
+  capabilities: function() { return ipcRenderer.sendSync('bridge-capabilities-sync'); },
+  environment: function() { return ipcRenderer.sendSync('bridge-environment-sync'); },
   clientToShellAsJSON: function(json) { ipcRenderer.send('bridge-shell-message', json); }
-};
+});
 
-window.LIBBY_WINDOWS = Object.freeze({
+contextBridge.exposeInMainWorld('LIBBY_WINDOWS', Object.freeze({
   retry: () => ipcRenderer.send('recovery-retry'),
   diagnostics: () => ipcRenderer.send('recovery-diagnostics')
-});
+}));
 
 const pending = [];
 let bridgeListenersReady = false;
