@@ -6,7 +6,7 @@ const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
 const PRODUCT = 'Libby';
 const ENVIRONMENT = 'charlie';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (${PRODUCT}; Windows; ${APP_VERSION}; RELEASE)`;
+const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36 (Dewey; V32; Windows; ${APP_VERSION}; RELEASE)`;
 
 let mainWindow;
 let shellState = { lastNavigation: ROOT_URL };
