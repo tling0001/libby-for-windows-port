@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Windows App
+    name: Build Windows ZIP
     runs-on: windows-latest
 
     steps:
@@ -24,24 +24,32 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install dependencies
-        run: npm install --no-audit
+      # electron-builder's ZIP target uses 7-Zip. Cache the builder tools so
+      # every workflow does not spend 6–7 minutes downloading 7zip-win-x64.
+      - name: Cache electron-builder tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron-builder\Cache
+            ~\.cache\electron-builder
+          key: electron-builder-tools-windows-v1
 
-      - name: Build Windows packages
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build Windows ZIP
         run: npm run dist
 
-      - name: Upload build artifacts
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Libby-Windows
-          path: |
-            dist/*.zip
-          if-no-files-found: warn
+          name: Libby-Windows-ZIP
+          path: dist/*.zip
+          if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.zip
+          files: dist/*.zip
           generate_release_notes: true
