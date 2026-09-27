@@ -1,56 +1,68 @@
-const {
-  app, BrowserWindow, BrowserView, session, shell, ipcMain, dialog,
-  Notification, nativeTheme, globalShortcut, Menu, clipboard
-} = require('electron');
+const { app, BrowserWindow, session, shell, ipcMain, dialog, Notification, nativeTheme, globalShortcut, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
 const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
-const PRODUCT = 'Dewey';
-const SPEC = 'V32';
+const PRODUCT = 'Libby';
 const ENVIRONMENT = 'charlie';
+const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (Dewey; V32; Android; ${APP_VERSION}; RELEASE)`;
 
-// Requested Libby native-shell UA.
-// Keep the Chrome version explicit so it is stable across Electron updates.
-const APP_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-  'Chrome/140.0.0.0 Safari/537.36 ' +
-  `(Dewey; V32; Android; ${APP_VERSION}; RELEASE)`;
-
-let mainWindow = null;
-let splashWindow = null;
-let splashClosed = false;
+let mainWindow;
 let shellState = { lastNavigation: ROOT_URL };
-const pendingNativeEvents = [];
 
 function dataDir() {
-  const p = path.join(app.getPath('userData'), 'libby');
-  fs.mkdirSync(p, { recursive: true });
-  return p;
+  return path.join(app.getPath('userData'), 'libby');
 }
+
 function downloadsDir() {
   const p = path.join(app.getPath('downloads'), 'Libby');
   fs.mkdirSync(p, { recursive: true });
   return p;
 }
 
-function androidCapabilities() {
-  // Base capabilities copied from the Android 9.5.0 resources.
-  // Keep these conservative: do not advertise invented capabilities because
-  // the web client uses this object to select its native-shell paths.
-  const value = {
+function sendShellEvent(payload) {
+  if (!mainWindow || mainWindow.isDestroyed() || !payload) return;
+  let json;
+  try { json = JSON.stringify(payload).replace(/\\u2028/g, '\\\\u2028').replace(/\\u2029/g, '\\\\u2029'); } catch { return; }
+  const script = `window.dispatchEvent(new CustomEvent('bridge:receive', { detail: ${json} }));`;
+  mainWindow.webContents.executeJavaScript(script, true).catch(() => {});
+}
+
+function platformTraits() {
+  return {
+    name: 'platform:traits',
+    dest: 'client',
+    device: {
+      brand: 'Microsoft',
+      model: 'Windows PC',
+      platform: 'Windows',
+      platformBuild: process.getSystemVersion(),
+      platformVersion: process.getSystemVersion(),
+      platformVersionInt: 0
+    },
+    profile: {
+      darkTheme: nativeTheme.shouldUseDarkColors,
+      highContrast: false,
+      storagePath: dataDir(),
+      installer: 'electron',
+      language: { app: app.getLocale(), system: app.getLocale() }
+    }
+  };
+}
+
+function capabilities() {
+  return JSON.stringify({
     bank: true,
     'ui:bifocal-webview': true,
     'ui:auth-webview': true,
     'network:info': true,
     'debug:diagnostics-option': false,
-    'debug:download-queue': false,
+    'debug:download-queue': true,
     'diagnostics:log': true,
     'audio:autonomous': true,
     geolocation: true,
-    'ui:haptics': true,
+    'ui:haptics': false,
     'feedback:store': null,
     'email:compose': true,
     'platform:traits': true,
@@ -60,293 +72,79 @@ function androidCapabilities() {
     'ui:oauth': 'dewey-oauth',
     'notifier:schedule': true,
     'notifier:badge': false,
-    'notifier:list': null,
-    'nav:share': ['url', 'text', 'image', 'file']
-  };
-
-  // cp1.java adds these at runtime on supported Android versions.
-  value['notifier:receive'] = true;
-  value['notifier:list'] = true;
-  value['diagnostics:platform-settings'] =
-    ['app', 'app-geolocation-permissions', 'app-notifications', 'network', 'app-language'];
-  value['ui:passkey'] = true;
-  value['audio:speech-synthesis'] = { supported: true, resumable: false };
-  value['dervish:activity'] = { pending: true };
-  value['platform:referrer'] = ['install', 'session'];
-
-  return JSON.stringify(value);
-}
-
-function androidEnvironment() {
-  return ENVIRONMENT;
-}
-
-function platformTraits(dest = 'client') {
-  return {
-    name: 'platform:traits',
-    dest,
-    device: {
-      brand: 'Microsoft',
-      model: 'Windows PC',
-      platform: 'Android',
-      platformBuild: process.getSystemVersion(),
-      platformVersion: process.getSystemVersion(),
-      platformVersionInt: 0
-    },
-    profile: {
-      darkTheme: nativeTheme.shouldUseDarkColors,
-      highContrast: false,
-      storagePath: dataDir(),
-      installer: 'windows',
-      language: { app: app.getLocale(), system: app.getLocale() }
-    }
-  };
-}
-
-function emitToPage(payload) {
-  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) {
-    pendingNativeEvents.push(payload);
-    return;
-  }
-  // Run in the actual page/main world. Android's cp1 sends a DOM CustomEvent
-  // named exactly "bridge:receive".
-  const encoded = JSON.stringify(payload);
-  const script = `
-    (() => {
-      const detail = ${encoded};
-      window.dispatchEvent(new CustomEvent('bridge:receive', { detail }));
-    })();
-  `;
-  mainWindow.webContents.executeJavaScript(script, true).catch(() => {
-    pendingNativeEvents.push(payload);
+    'notifier:list': true,
+    'nav:share': ['url', 'text', 'image', 'file'],
+    'notifier:receive': true,
+    'ui:passkey': true,
+    'audio:speech-synthesis': { supported: true, resumable: false },
+    'platform:referrer': ['install', 'session']
   });
 }
 
-function flushNativeEvents() {
-  if (!pendingNativeEvents.length) return;
-  const events = pendingNativeEvents.splice(0);
-  for (const event of events) emitToPage(event);
-}
-
-async function sendShellResponse(name, data = {}, dest = 'client') {
-  emitToPage({ name, dest, ...data });
-}
-
-function safeParse(raw) {
-  try {
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
-  } catch {
-    return null;
-  }
-}
-
-// Minimal persistent "bank" store. The Android app uses bank:* as a native
-// persistence service; keeping it persistent across launches is important.
-const bankFile = () => path.join(dataDir(), 'bank.json');
-function readBank() {
-  try { return JSON.parse(fs.readFileSync(bankFile(), 'utf8')); } catch { return {}; }
-}
-function writeBank(obj) {
-  fs.writeFileSync(bankFile(), JSON.stringify(obj));
-}
-
-async function handleBank(name, msg) {
-  const store = readBank();
-  const data = msg.data && typeof msg.data === 'object' ? msg.data : msg;
-  const key = data.key ?? data.name ?? data.id;
-  if (name === 'bank:read' || name === 'bank:get') {
-    return sendShellResponse('bank:response', { key, value: key == null ? null : store[key] });
-  }
-  if (name === 'bank:write' || name === 'bank:set' || name === 'bank:put') {
-    if (key != null) store[key] = data.value;
-    writeBank(store);
-    return sendShellResponse('bank:response', { key, value: key == null ? null : store[key] });
-  }
-  if (name === 'bank:delete' || name === 'bank:remove') {
-    if (key != null) delete store[key];
-    writeBank(store);
-    return sendShellResponse('bank:response', { key, value: null });
-  }
-  if (name === 'bank:exists') {
-    return sendShellResponse('bank:response', { key, exists: key != null && Object.prototype.hasOwnProperty.call(store, key) });
-  }
-  if (name === 'bank:list') {
-    return sendShellResponse('bank:response', { keys: Object.keys(store) });
-  }
-  if (name === 'bank:wipe' || name === 'bank:wipe:all') {
-    writeBank({});
-    return sendShellResponse('bank:response', { ok: true });
-  }
-}
-
 async function handleShellMessage(raw) {
-  const msg = safeParse(raw);
+  let msg;
+  try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return; }
   if (!msg || typeof msg !== 'object') return;
-  const name = String(msg.name || '');
-  const dest = msg.dest || 'client';
-  const data = msg.data && typeof msg.data === 'object' ? msg.data : msg;
 
-  if (name.startsWith('bank:')) return handleBank(name, msg);
+  const name = msg.name || '';
+  const data = msg.data || msg;
 
   if (name === 'platform:traits') {
-    return sendShellResponse('platform:traits', platformTraits(dest), dest);
-  }
-
-  if (name === 'network:info') {
-    return sendShellResponse('network:info', {
-      reachable: true,
-      metered: false,
-      connection: 'ethernet'
-    }, dest);
-  }
-
-  if (name === 'environment:launch') {
-    // Android receives this as a request to relaunch the client WebView.
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.reload();
-    }
+    sendShellEvent(platformTraits());
     return;
   }
 
-  if (name === 'ui:haptics') return;
+  if (name === 'network:info') {
+    sendShellEvent({ name, dest: msg.dest || 'client', reachable: true, metered: false, connection: 'ethernet' });
+    return;
+  }
+
+  if (name.startsWith('nav:')) {
+    shellState.lastNavigation = msg.path || msg.url || ROOT_URL;
+    return;
+  }
 
   if (name === 'email:compose') {
     const to = encodeURIComponent(data.to || '');
     const subject = encodeURIComponent(data.subject || '');
     const body = encodeURIComponent(data.body || '');
-    return shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
+    await shell.openExternal(`mailto:${to}?subject=${subject}&body=${body}`).catch(() => {});
+    return;
   }
 
   if (name === 'nav:share') {
     const text = data.text || data.url || '';
     if (text) {
-      clipboard.writeText(text);
-      if (Notification.isSupported()) {
+      await require('electron').clipboard.writeText(text).catch(() => {});
+      if (mainWindow && !mainWindow.isDestroyed()) {
         new Notification({ title: 'Libby', body: 'Link copied to the clipboard.' }).show();
       }
     }
     return;
   }
 
+  if (name === 'ui:haptics') return;
+
   if (name === 'notifier:schedule') {
     const title = data.title || 'Libby';
     const body = data.body || data.message || '';
-    const delay = Math.max(0, Number(data.delayMs ?? data.delay ?? 0));
+    const delay = Math.max(0, Number(data.delayMs || data.delay || 0));
     setTimeout(() => {
       if (Notification.isSupported()) new Notification({ title, body }).show();
     }, delay);
     return;
   }
 
-  if (name === 'notifier:cancel') return;
-  if (name === 'notifier:list') return sendShellResponse('notifier:list', { notifications: [] });
-  if (name === 'title:list:playable') return;
-
-  if (name.startsWith('roster:')) {
-    // Keep the request observable and non-blocking. Full roster synchronization
-    // is implemented separately; never stall the client waiting for it.
-    return sendShellResponse('roster:response', {
-      request: msg.request || data.request,
-      status: 501,
-      headers: {},
-      rosters: []
-    });
-  }
-
   if (name === 'audioproxy:configure') {
-    return sendShellResponse('audioproxy:configure', {
-      volume: 1, playbackRate: 1
-    }, 'bifocal');
-  }
-
-  if (name === 'audio:sleep-at-position' || name === 'audio:milestones') return;
-}
-
-function createSplashWindow() {
-  if (splashWindow && !splashWindow.isDestroyed()) return;
-  const { screen } = require('electron');
-  const display = screen.getPrimaryDisplay();
-  const { x, y, width, height } = display.bounds;
-  splashClosed = false;
-  splashWindow = new BrowserWindow({
-    x, y, width, height,
-    frame: false,
-    resizable: false,
-    movable: false,
-    minimizable: false,
-    maximizable: false,
-    closable: true,
-    fullscreen: true,
-    alwaysOnTop: true,
-    show: false,
-    backgroundColor: '#111111',
-    skipTaskbar: true,
-    focusable: true,
-    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
-  });
-  splashWindow.setAlwaysOnTop(true, 'floating');
-  splashWindow.loadFile(path.join(__dirname, 'splash.html'));
-  splashWindow.once('ready-to-show', () => {
-    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
-  });
-  splashWindow.webContents.on('before-input-event', (_event, input) => {
-    if (input.key === 'Escape' && input.type === 'keyDown') closeSplash(true);
-  });
-  splashWindow.on('closed', () => { splashWindow = null; splashClosed = true; });
-}
-
-function closeSplash(immediate = false) {
-  const splash = splashWindow;
-  if (!splash || splash.isDestroyed()) {
-    splashWindow = null;
+    sendShellEvent({ name, dest: 'bifocal', volume: 1, playbackRate: 1 });
     return;
   }
-  splashClosed = true;
-  try { splash.setAlwaysOnTop(false); } catch {}
-  if (immediate) {
-    try { splash.destroy(); } catch {}
-    if (splashWindow === splash) splashWindow = null;
-    return;
-  }
-  // Keep the Android-style launch artwork for a brief, polished fade only
-  // after the real Libby window has become visible. No startup timeout is used.
-  splash.webContents.executeJavaScript(
-    `document.body.style.transition='opacity .16s ease';document.body.style.opacity='0';`
-  ).catch(() => {});
-  setTimeout(() => {
-    if (!splash.isDestroyed()) {
-      try { splash.close(); } catch { try { splash.destroy(); } catch {} }
-    }
-    if (splashWindow === splash) splashWindow = null;
-  }, 180);
 }
 
 function createWindow() {
   const partition = 'persist:libby';
-  // Keep the desktop shell polished without changing Libby's web UI.
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: 'Libby', submenu: [
-      { label: 'Reload', accelerator: 'Ctrl+R', click: () => mainWindow?.webContents.reload() },
-      { label: 'Hard Reload', accelerator: 'Ctrl+Shift+R', click: () => mainWindow?.webContents.reloadIgnoringCache() },
-      { type: 'separator' },
-      { role: 'toggleDevTools' },
-      { type: 'separator' },
-      { role: 'quit' }
-    ]},
-    { label: 'View', submenu: [
-      { role: 'togglefullscreen' },
-      { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' }
-    ]},
-    { label: 'Help', submenu: [
-      { label: 'Open Libby website', click: () => shell.openExternal(ROOT_URL).catch(() => {}) }
-    ]}
-  ]));
   const ses = session.fromPartition(partition);
-
   ses.setUserAgent(APP_USER_AGENT);
-
-  // Android WebView accepts third-party cookies.
-  ses.cookies.flushStore().catch(() => {});
 
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -368,57 +166,78 @@ function createWindow() {
     }
   });
 
-  // Match the Android WebView's basic settings.
-  mainWindow.webContents.setUserAgent(APP_USER_AGENT);
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: 'File', submenu: [
+      { label: 'Reload', accelerator: 'Ctrl+R', click: () => mainWindow.webContents.reload() },
+      { label: 'Hard Reload', accelerator: 'Ctrl+Shift+R', click: () => mainWindow.webContents.reloadIgnoringCache() },
+      { type: 'separator' },
+      { label: 'Print', accelerator: 'Ctrl+P', click: () => mainWindow.webContents.print({}) },
+      { label: 'Save page as PDF', click: async () => {
+        const { filePath } = await dialog.showSaveDialog(mainWindow, { defaultPath: path.join(downloadsDir(), 'libby-page.pdf'), filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+        if (!filePath) return;
+        const pdf = await mainWindow.webContents.printToPDF({ printBackground: true });
+        fs.writeFileSync(filePath, pdf);
+      } },
+      { type: 'separator' },
+      { label: 'Exit', role: 'quit' }
+    ]},
+    { label: 'View', submenu: [
+      { role: 'togglefullscreen' },
+      { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' },
+      { type: 'separator' }, { role: 'toggleDevTools' }
+    ]},
+    { label: 'Help', submenu: [
+      { label: 'Open Libby website', click: () => shell.openExternal(ROOT_URL) },
+      { label: 'Open app data folder', click: () => shell.openPath(dataDir()) }
+    ]}
+  ]));
 
-  // Do not impose a host allow-list on Libby's navigation. Android WebView
-  // follows HTTPS redirects; blocking an auth/CDN redirect can leave Libby
-  // permanently on its loading screen.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) return { action: 'allow' };
-    shell.openExternal(url).catch(() => {});
-    return { action: 'deny' };
-  });
-
-  ses.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'].includes(permission));
-  });
-  ses.setPermissionCheckHandler((_wc, permission) => {
-    return ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'].includes(permission);
-  });
-
+  // Downloads: preserve Libby's downloadable content rather than losing it to a browser temp folder.
   ses.on('will-download', (event, item) => {
-    const target = path.join(downloadsDir(), item.getFilename());
+    const filename = item.getFilename();
+    const target = path.join(downloadsDir(), filename);
     item.setSavePath(target);
     item.once('done', (_e, state) => {
       if (state === 'completed' && Notification.isSupported()) {
-        new Notification({ title: 'Libby download complete', body: item.getFilename() }).show();
+        new Notification({ title: 'Libby download complete', body: filename }).show();
       }
     });
   });
 
-  mainWindow.webContents.on('console-message', (_event, details) => {
-    try { fs.appendFileSync(path.join(dataDir(), 'diagnostics.log'), JSON.stringify({ time: new Date().toISOString(), type: 'console', level: details.level, message: details.message, source: details.sourceId, line: details.lineNumber }) + '\n'); } catch {}
-  });
-  mainWindow.webContents.on('did-navigate', (_e, url) => { shellState.lastNavigation = url; });
-
-  mainWindow.webContents.on('did-finish-load', () => {
-    flushNativeEvents();
+  ses.setPermissionRequestHandler((webContents, permission, callback) => {
+    const allowed = ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'];
+    callback(allowed.includes(permission));
   });
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
-    closeSplash();
+  ses.setPermissionCheckHandler((_webContents, permission) => {
+    return ['geolocation', 'notifications', 'media', 'clipboard-read', 'clipboard-sanitized-write'].includes(permission);
   });
 
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://libbyapp.com') || url.startsWith('https://www.libbyapp.com')) {
+      return { action: 'allow' };
+    }
+    shell.openExternal(url).catch(() => {});
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!/^https:\/\/([a-z0-9-]+\.)*libbyapp\.com\//i.test(url) && !/^https:\/\/[^/]*overdrive\.com\//i.test(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+    }
+  });
+
+  mainWindow.webContents.on('did-navigate', (_event, url) => { shellState.lastNavigation = url; });
+  mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.on('closed', () => { mainWindow = null; });
+  ses.clearCache().catch(() => {}).finally(() => mainWindow.loadURL(ROOT_URL));
 
-  // IMPORTANT: ip1.loadUrl() calls clearCache(true) on every load.
-  // Clear Chromium HTTP cache but retain cookies/local storage/IndexedDB.
-  ses.clearCache().catch(() => {}).finally(() => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(ROOT_URL);
-  });
-
+  // Windows media keys: ask the page's Media Session implementation to handle them.
+  const mediaCommands = {
+    MediaPlayPause: `navigator.mediaSession?.setActionHandler ? null : null`,
+    MediaNextTrack: `navigator.mediaSession?.setActionHandler ? null : null`
+  };
   try {
     globalShortcut.register('MediaPlayPause', () => mainWindow?.webContents.send('libby-media-key', 'playpause'));
     globalShortcut.register('MediaNextTrack', () => mainWindow?.webContents.send('libby-media-key', 'next'));
@@ -426,34 +245,18 @@ function createWindow() {
   } catch {}
 }
 
-ipcMain.on('bridge-capabilities-sync', (event) => {
-  event.returnValue = androidCapabilities();
-});
-ipcMain.on('bridge-environment-sync', (event) => {
-  event.returnValue = androidEnvironment();
-});
-ipcMain.on('bridge-shell-message', (_event, raw) => {
-  void handleShellMessage(raw);
-});
-ipcMain.handle('app-paths', () => ({
-  userData: app.getPath('userData'),
-  downloads: downloadsDir()
-}));
+ipcMain.handle('bridge-capabilities', () => capabilities());
+ipcMain.handle('bridge-environment', () => ENVIRONMENT);
+ipcMain.handle('bridge-shell-message', (_event, raw) => handleShellMessage(raw));
+ipcMain.on('bridge-shell-message-sync', (_event, raw) => { handleShellMessage(raw).catch(() => {}); });
+ipcMain.handle('app-paths', () => ({ userData: app.getPath('userData'), downloads: downloadsDir() }));
 ipcMain.handle('open-external', (_event, url) => shell.openExternal(url));
 
 app.whenReady().then(() => {
-  app.setAppUserModelId('com.overdrive.mobile.android.libby');
-  createSplashWindow();
+  app.setAppUserModelId('com.overdrive.mobile.windows.libby');
   createWindow();
-
-  app.on('activate', () => {
-    if (!mainWindow) createWindow();
-  });
+  app.on('activate', () => { if (!mainWindow) createWindow(); });
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-app.on('will-quit', () => {
-  try { globalShortcut.unregisterAll(); } catch {}
-});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch {} });

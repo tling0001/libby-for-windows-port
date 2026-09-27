@@ -1,7 +1,7 @@
 {
   "name": "libby-windows-port",
-  "version": "9.5.0-windows.11",
-  "description": "Windows port of the supplied Libby Android 9.5.0 shell",
+  "version": "9.5.0-windows.2",
+  "description": "Windows Electron port of the supplied Libby Android 9.5.0 shell",
   "main": "src/main.js",
   "author": "Local Windows port",
   "license": "UNLICENSED",
@@ -9,14 +9,16 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --enable-logging",
-    "dist": "electron-builder --win zip --publish never"
+    "dist": "electron-builder --win zip --publish never",
+    "dist:portable": "electron-builder --win portable",
+    "dist:installer": "electron-builder --win nsis"
   },
   "devDependencies": {
-    "electron": "38.8.6",
-    "electron-builder": "26.15.3"
+    "electron": "^38.2.0",
+    "electron-builder": "^26.0.12"
   },
   "build": {
-    "appId": "com.overdrive.mobile.android.libby",
+    "appId": "com.overdrive.mobile.windows.libby",
     "productName": "Libby",
     "artifactName": "Libby-Windows-${version}-${arch}.${ext}",
     "asar": true,
@@ -32,6 +34,14 @@
       ],
       "icon": "assets/libby.ico",
       "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Libby"
     }
   }
 }
