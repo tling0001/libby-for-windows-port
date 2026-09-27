@@ -1,8 +1,5 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { ipcRenderer } = require('electron');
 
-// Android's cp1 Java object exposes these three methods directly and
-// synchronously. Keeping the values in the preload removes a renderer->main
-// IPC round trip from the earliest boot code and matches WebView semantics.
 const CAPABILITIES = JSON.stringify({
   bank: true,
   'ui:bifocal-webview': true,
@@ -23,7 +20,7 @@ const CAPABILITIES = JSON.stringify({
   'ui:oauth': 'dewey-oauth',
   'notifier:schedule': true,
   'notifier:badge': false,
-  'notifier:list': null,
+  'notifier:list': true,
   'nav:share': ['url', 'text', 'image', 'file'],
   'notifier:receive': true,
   'ui:passkey': true,
@@ -34,24 +31,52 @@ const CAPABILITIES = JSON.stringify({
 });
 const ENVIRONMENT = 'charlie';
 
-contextBridge.exposeInMainWorld('LIBBY_WINDOWS', Object.freeze({
+// Use the same shape as Android's injected Java object: a real object in the
+// page's main JS world with synchronous methods, not an asynchronous Promise
+// proxy. Electron still has no Node integration, so exposing these two values
+// is safe while shell messages go through the isolated IPC boundary.
+
+try {
+  Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Win32' });
+  Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' });
+  Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { configurable: true, get: () => 0 });
+  // Electron exposes Chromium UA Client Hints that can reveal the host even when
+  // navigator.userAgent is overridden. Present ordinary Chrome/Windows hints.
+  const chromeMajor = Number(String(process.versions.chrome || '140').split('.')[0]);
+  const uaData = {
+    brands: [
+      { brand: 'Chromium', version: String(chromeMajor) },
+      { brand: 'Google Chrome', version: String(chromeMajor) }
+    ],
+    mobile: false,
+    platform: 'Windows',
+    getHighEntropyValues: async () => ({
+      brands: [
+        { brand: 'Chromium', version: String(chromeMajor) },
+        { brand: 'Google Chrome', version: String(chromeMajor) }
+      ],
+      mobile: false, platform: 'Windows', platformVersion: '10.0.0',
+      architecture: 'x86', bitness: '64', model: '', uaFullVersion: String(process.versions.chrome || '')
+    })
+  };
+  Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => uaData });
+} catch {}
+
+window.BRIDGE = {
+  capabilities: function() { return CAPABILITIES; },
+  environment: function() { return ENVIRONMENT; },
+  clientToShellAsJSON: function(json) { ipcRenderer.send('bridge-shell-message', json); }
+};
+
+window.LIBBY_WINDOWS = Object.freeze({
   retry: () => ipcRenderer.send('recovery-retry'),
   diagnostics: () => ipcRenderer.send('recovery-diagnostics')
-}));
+});
 
-contextBridge.exposeInMainWorld('BRIDGE', Object.freeze({
-  capabilities: () => CAPABILITIES,
-  environment: () => ENVIRONMENT,
-  clientToShellAsJSON: (json) => ipcRenderer.send('bridge-shell-message', json)
-}));
-
-// The Android shell dispatches exactly this DOM event. Keep a tiny queue so a
-// native startup signal cannot be lost if it arrives during document startup.
 const pending = [];
 let bridgeListenersReady = false;
 function deliver(payload) {
-  const event = new CustomEvent('bridge:receive', { detail: payload });
-  window.dispatchEvent(event);
+  window.dispatchEvent(new CustomEvent('bridge:receive', { detail: payload }));
 }
 ipcRenderer.on('libby-shell-event', (_event, payload) => {
   if (!bridgeListenersReady && document.readyState === 'loading') pending.push(payload);
@@ -64,7 +89,6 @@ window.addEventListener('DOMContentLoaded', () => {
   bridgeListenersReady = true;
   while (pending.length) deliver(pending.shift());
 });
-
 window.addEventListener('error', (event) => {
   ipcRenderer.send('renderer-diagnostic', {
     type: 'error', message: event.message || String(event.error || 'renderer error'),

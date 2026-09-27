@@ -328,7 +328,7 @@ function configureWebContents(contents) {
           webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             partition: 'persist:libby',
-            contextIsolation: true,
+            contextIsolation: false,
             sandbox: false,
             nodeIntegration: false
           }
@@ -350,6 +350,16 @@ function configureWebContents(contents) {
 function setupSession(ses) {
   libbySession = ses;
   ses.setUserAgent(APP_USER_AGENT, 'en-US,en');
+  // Android WebView supplies the application's package in X-Requested-With.
+  // Libby's native shell can use this as part of its WebView/runtime detection.
+  try {
+    ses.webRequest.onBeforeSendHeaders({ urls: ['https://libbyapp.com/*', 'https://*.libbyapp.com/*', 'https://overdrive.com/*', 'https://*.overdrive.com/*'] }, (details, callback) => {
+      details.requestHeaders['User-Agent'] = APP_USER_AGENT;
+      details.requestHeaders['X-Requested-With'] = 'com.overdrive.mobile.android.libby';
+      details.requestHeaders['Accept-Language'] = app.getLocale() || 'en-US';
+      callback({ requestHeaders: details.requestHeaders });
+    });
+  } catch (e) { diagnostic('webrequest:setup-error', { error: String(e) }); }
 
   // Persist cookies, IndexedDB, service workers, cache and local storage in the
   // same session. This is the closest Windows equivalent of Android WebView's
@@ -429,7 +439,7 @@ function openAuthWindow(msg, sourceContents) {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition: 'persist:libby',
-      contextIsolation: true,
+      contextIsolation: false,
       sandbox: false,
       nodeIntegration: false
     }
@@ -459,7 +469,7 @@ function openBifocalWindow(msg) {
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         partition: 'persist:libby',
-        contextIsolation: true,
+        contextIsolation: false,
         sandbox: false,
         nodeIntegration: false
       }
@@ -577,6 +587,85 @@ function scheduleNotification(data) {
   }, delay);
   notifications.set(id, timer);
   return id;
+}
+
+
+async function handleRosterRequest(msg, sourceContents) {
+  const url = String(msg.url || '');
+  let parsed;
+  try { parsed = new URL(url); } catch {
+    sendShellEvent({ name: 'roster:error', dest: 'client', url, error: 'Invalid roster URL' }, sourceContents);
+    return;
+  }
+  if (parsed.protocol !== 'https:' || !(parsed.hostname === 'libbyapp.com' || parsed.hostname.endsWith('.libbyapp.com') || parsed.hostname === 'overdrive.com' || parsed.hostname.endsWith('.overdrive.com'))) {
+    sendShellEvent({ name: 'roster:error', dest: 'client', url, error: 'Untrusted roster URL' }, sourceContents);
+    return;
+  }
+  diagnostic('roster:request', { url });
+  try {
+    const response = await libbySession.fetch(url, {
+      headers: {
+        'User-Agent': APP_USER_AGENT,
+        'X-Requested-With': 'com.overdrive.mobile.android.libby',
+        'Accept': 'application/json, text/plain, */*'
+      }
+    });
+    const textBody = await response.text();
+    const responseHeaders = {};
+    for (const [k, v] of response.headers.entries()) responseHeaders[k] = v;
+    const result = {
+      name: 'roster:response',
+      dest: 'client',
+      url,
+      response: { status: response.status, headers: responseHeaders }
+    };
+    if (textBody) {
+      try {
+        const parsedBody = JSON.parse(textBody);
+        if (Array.isArray(parsedBody)) result.rosters = parsedBody;
+        else if (parsedBody && typeof parsedBody === 'object') result.rosters = parsedBody;
+      } catch {
+        // Android only includes rosters when the response is valid JSON.
+      }
+    }
+    sendShellEvent(result, sourceContents);
+  } catch (error) {
+    diagnostic('roster:error', { url, error: String(error) });
+    sendShellEvent({ name: 'roster:error', dest: 'client', url, error: String(error?.message || error) }, sourceContents);
+  }
+}
+
+function handleRosterMessage(msg, sourceContents) {
+  const name = String(msg.name || '');
+  if (name === 'roster:request') { void handleRosterRequest(msg, sourceContents); return true; }
+  if (name === 'roster:initialize') {
+    const roster = msg.roster;
+    try {
+      const file = path.join(dataDir(), 'rosters.json');
+      let all = {};
+      try { all = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+      const id = String(roster?.id || '');
+      if (id) all[id] = safeJson(roster);
+      fs.writeFileSync(file, JSON.stringify(all, null, 2), 'utf8');
+    } catch (e) { diagnostic('roster:initialize-error', { error: String(e) }); }
+    sendShellEvent({ name: 'roster:entry:response', dest: 'client', id: roster?.id || '', success: true }, sourceContents);
+    return true;
+  }
+  if (name === 'roster:audit') {
+    sendShellEvent({ name: 'roster:audit', dest: 'client', rosters: [] }, sourceContents);
+    return true;
+  }
+  if (name === 'roster:clean' || name === 'roster:flush:all' || name === 'roster:halt:all' ||
+      name === 'roster:pause:role' || name === 'roster:resume:role' ||
+      name === 'roster:wipe' || name === 'roster:wipe:all') {
+    diagnostic('roster:command', { name });
+    return true;
+  }
+  if (name.startsWith('roster:')) {
+    sendShellEvent({ name: 'roster:error', dest: 'client', error: `Unsupported native roster operation: ${name}` }, sourceContents);
+    return true;
+  }
+  return false;
 }
 
 async function handleShellMessage(raw, sourceContents) {
@@ -788,6 +877,16 @@ async function handleShellMessage(raw, sourceContents) {
     return;
   }
 
+  if (name === 'title:list:playable') {
+    let titles = [];
+    try {
+      const f = path.join(dataDir(), 'playable-titles.json');
+      if (fs.existsSync(f)) titles = JSON.parse(fs.readFileSync(f, 'utf8')) || [];
+    } catch {}
+    sendShellEvent({ name, dest: 'client', titles }, sourceContents);
+    return;
+  }
+
   if (name.startsWith('bank:')) { handleBankMessage(msg); return; }
 
   // Android forwards several commands to the shell and echoes/dispatches the
@@ -839,7 +938,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition,
-      contextIsolation: true,
+      contextIsolation: false,
       sandbox: false,
       nodeIntegration: false,
       spellcheck: true,
