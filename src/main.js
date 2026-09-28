@@ -215,8 +215,34 @@ function createWindow() {
     try { Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' }); } catch (_) {}
   })();`);
 
-  // Libby is a kiosk-style app: do not show Electron's File/View/Help menu bar.
-  Menu.setApplicationMenu(null);
+  // Keep Electron's standard application menu. The original Windows port exposed
+  // File/View/Help, and retaining it avoids changing Chromium/Electron keyboard,
+  // reload, and menu behavior while we diagnose Libby's startup compatibility.
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: 'File', submenu: [
+      { label: 'Reload', accelerator: 'Ctrl+R', click: () => mainWindow.webContents.reload() },
+      { label: 'Hard Reload', accelerator: 'Ctrl+Shift+R', click: () => mainWindow.webContents.reloadIgnoringCache() },
+      { type: 'separator' },
+      { label: 'Print', accelerator: 'Ctrl+P', click: () => mainWindow.webContents.print({}) },
+      { label: 'Save page as PDF', click: async () => {
+        const { filePath } = await dialog.showSaveDialog(mainWindow, { defaultPath: path.join(downloadsDir(), 'libby-page.pdf'), filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+        if (!filePath) return;
+        const pdf = await mainWindow.webContents.printToPDF({ printBackground: true });
+        fs.writeFileSync(filePath, pdf);
+      } },
+      { type: 'separator' },
+      { label: 'Exit', role: 'quit' }
+    ]},
+    { label: 'View', submenu: [
+      { role: 'togglefullscreen' },
+      { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' },
+      { type: 'separator' }, { role: 'toggleDevTools' }
+    ]},
+    { label: 'Help', submenu: [
+      { label: 'Open Libby website', click: () => shell.openExternal(ROOT_URL) },
+      { label: 'Open app data folder', click: () => shell.openPath(dataDir()) }
+    ]}
+  ]));
 
   // Downloads: preserve Libby's downloadable content rather than losing it to a browser temp folder.
   ses.on('will-download', (event, item) => {
