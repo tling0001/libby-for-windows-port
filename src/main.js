@@ -1,4 +1,6 @@
 const { app, BrowserWindow, session, shell, ipcMain, dialog, Notification, nativeTheme, globalShortcut, Menu } = require('electron');
+// Libby's shell identification is based on the legacy UA, not Chromium UA-CH.
+app.commandLine.appendSwitch('disable-features', 'UserAgentClientHint');
 const path = require('path');
 const fs = require('fs');
 
@@ -6,7 +8,7 @@ const ROOT_URL = 'https://libbyapp.com';
 const APP_VERSION = '9.5.0';
 const PRODUCT = 'Libby';
 const ENVIRONMENT = 'charlie';
-const APP_USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (${PRODUCT}; Windows; ${APP_VERSION}; RELEASE)`;
+const APP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (Dewey; V32; Android; 9.5.0; RELEASE)';
 
 let mainWindow;
 let splashWindow;
@@ -167,6 +169,24 @@ function createWindow() {
   const ses = session.fromPartition(partition);
   ses.setUserAgent(APP_USER_AGENT);
 
+  // Libby identifies its shell from the legacy UA string. Force the same UA on
+  // outgoing requests as well, including requests made before navigation starts.
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    details.requestHeaders['User-Agent'] = APP_USER_AGENT;
+    callback({ requestHeaders: details.requestHeaders });
+  });
+
+  // Chromium 140 normally advertises its native browser identity through UA-CH.
+  // Hide that desktop-browser signal and expose the Dewey shell identity instead.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    delete headers['Accept-CH'];
+    delete headers['accept-ch'];
+    callback({ responseHeaders: headers });
+  });
+
+  // Make the page's legacy navigator.userAgent match the Android Dewey shell too.
+  // This is intentionally installed in the main world before any Libby code runs.
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 900,
@@ -187,31 +207,16 @@ function createWindow() {
     }
   });
 
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: 'File', submenu: [
-      { label: 'Reload', accelerator: 'Ctrl+R', click: () => mainWindow.webContents.reload() },
-      { label: 'Hard Reload', accelerator: 'Ctrl+Shift+R', click: () => mainWindow.webContents.reloadIgnoringCache() },
-      { type: 'separator' },
-      { label: 'Print', accelerator: 'Ctrl+P', click: () => mainWindow.webContents.print({}) },
-      { label: 'Save page as PDF', click: async () => {
-        const { filePath } = await dialog.showSaveDialog(mainWindow, { defaultPath: path.join(downloadsDir(), 'libby-page.pdf'), filters: [{ name: 'PDF', extensions: ['pdf'] }] });
-        if (!filePath) return;
-        const pdf = await mainWindow.webContents.printToPDF({ printBackground: true });
-        fs.writeFileSync(filePath, pdf);
-      } },
-      { type: 'separator' },
-      { label: 'Exit', role: 'quit' }
-    ]},
-    { label: 'View', submenu: [
-      { role: 'togglefullscreen' },
-      { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' },
-      { type: 'separator' }, { role: 'toggleDevTools' }
-    ]},
-    { label: 'Help', submenu: [
-      { label: 'Open Libby website', click: () => shell.openExternal(ROOT_URL) },
-      { label: 'Open app data folder', click: () => shell.openPath(dataDir()) }
-    ]}
-  ]));
+  mainWindow.webContents.addScriptToEvaluateOnNewDocument(`(() => {
+    const ua = ${JSON.stringify('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 (Dewey; V32; Android; 9.5.0; RELEASE)')};
+    try { Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => ua }); } catch (_) {}
+    try { Object.defineProperty(Navigator.prototype, 'appVersion', { configurable: true, get: () => ua.slice(8) }); } catch (_) {}
+    try { Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Win32' }); } catch (_) {}
+    try { Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Google Inc.' }); } catch (_) {}
+  })();`);
+
+  // Libby is a kiosk-style app: do not show Electron's File/View/Help menu bar.
+  Menu.setApplicationMenu(null);
 
   // Downloads: preserve Libby's downloadable content rather than losing it to a browser temp folder.
   ses.on('will-download', (event, item) => {
