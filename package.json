@@ -1,6 +1,6 @@
 {
   "name": "libby-windows-port",
-  "version": "9.5.0-windows.13",
+  "version": "9.5.0-windows.14",
   "description": "Windows port of the supplied Libby Android 9.5.0 shell",
   "main": "src/main.js",
   "author": "Local Windows port",

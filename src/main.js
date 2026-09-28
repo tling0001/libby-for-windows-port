@@ -255,7 +255,21 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('did-navigate', (_event, url) => { shellState.lastNavigation = url; });
-  mainWindow.once('ready-to-show', () => { mainWindow.show(); setTimeout(closeSplash, 80); });
+  // Do not tie the splash to Electron's ready-to-show event. A remote WebView can
+  // remain in a loading state long enough that ready-to-show is never emitted.
+  // Android shows its WebView independently of page completion, so reveal the real
+  // window as soon as Chromium has a DOM, and also keep ready-to-show as a fallback.
+  let windowRevealed = false;
+  const revealMainWindow = () => {
+    if (windowRevealed || !mainWindow || mainWindow.isDestroyed()) return;
+    windowRevealed = true;
+    mainWindow.show();
+    closeSplash();
+  };
+  mainWindow.webContents.once('dom-ready', revealMainWindow);
+  mainWindow.webContents.once('did-finish-load', revealMainWindow);
+  mainWindow.webContents.once('did-fail-load', revealMainWindow);
+  mainWindow.once('ready-to-show', revealMainWindow);
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadURL(ROOT_URL);
 
